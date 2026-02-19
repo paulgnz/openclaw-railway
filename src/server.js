@@ -176,6 +176,18 @@ async function startGateway() {
   fs.mkdirSync(STATE_DIR, { recursive: true });
   fs.mkdirSync(WORKSPACE_DIR, { recursive: true });
 
+  // Ensure gateway config is correct on every start (covers existing deployments that
+  // onboarded before these settings were added).
+  try {
+    await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.auth.mode", "none"]));
+    await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.bind", "loopback"]));
+    await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.port", String(INTERNAL_GATEWAY_PORT)]));
+    await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "--json", "gateway.trustedProxies", JSON.stringify(["127.0.0.1"])]));
+    await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "--json", "gateway.controlUi.allowedOrigins", JSON.stringify(["*"])]));
+  } catch (err) {
+    console.error(`[gateway] config pre-flight failed (non-fatal): ${String(err)}`);
+  }
+
   // Gateway listens on loopback only — the wrapper handles all external authentication.
   // Using --auth none eliminates the challenge-response requirement that causes 1008 disconnects.
   const args = [
@@ -400,7 +412,7 @@ app.get("/healthz", async (_req, res) => {
 async function chatViaGateway(message, timeoutMs = 120000) {
   return new Promise((resolve, reject) => {
     const wsUrl = `ws://${INTERNAL_GATEWAY_HOST}:${INTERNAL_GATEWAY_PORT}/`;
-    const ws = new WebSocket(wsUrl);
+    const ws = new WebSocket(wsUrl, { headers: { Origin: `http://${INTERNAL_GATEWAY_HOST}:${INTERNAL_GATEWAY_PORT}` } });
     let sessionKey = null;
     let responseText = "";
     let chatSent = false;
@@ -970,6 +982,8 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
       OPENCLAW_NODE,
       clawArgs(["config", "set", "--json", "gateway.trustedProxies", JSON.stringify(["127.0.0.1"]) ]),
     );
+    // Allow internal WebSocket connections (chat relay) and all external origins (proxied through wrapper auth)
+    await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "--json", "gateway.controlUi.allowedOrigins", JSON.stringify(["*"])]));
 
     // Optional: configure a custom OpenAI-compatible provider (base URL) for advanced users.
     if (payload.customProviderId?.trim() && payload.customProviderBaseUrl?.trim()) {
@@ -1616,6 +1630,8 @@ const server = app.listen(PORT, "0.0.0.0", async () => {
         await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.bind", "loopback"]));
         await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.port", String(INTERNAL_GATEWAY_PORT)]));
         await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "--json", "gateway.trustedProxies", JSON.stringify(["127.0.0.1"])]));
+        // Allow internal WebSocket connections (chat relay) and all external origins (proxied through wrapper auth)
+        await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "--json", "gateway.controlUi.allowedOrigins", JSON.stringify(["*"])]));
 
         // Optional channels from env vars
         if (process.env.TELEGRAM_BOT_TOKEN?.trim()) {
