@@ -7,7 +7,6 @@ import path from "node:path";
 import express from "express";
 import httpProxy from "http-proxy";
 import * as tar from "tar";
-import WebSocket from "ws";
 
 // Migrate deprecated CLAWDBOT_* env vars → OPENCLAW_* so existing Railway deployments
 // keep working. Users should update their Railway Variables to use the new names.
@@ -176,17 +175,6 @@ async function startGateway() {
   fs.mkdirSync(STATE_DIR, { recursive: true });
   fs.mkdirSync(WORKSPACE_DIR, { recursive: true });
 
-  // Reset device identity if format changed (force regeneration)
-  const devicePath = path.join(STATE_DIR, "device-identity.json");
-  try {
-    const stored = JSON.parse(fs.readFileSync(devicePath, "utf8"));
-    if (stored.version !== 2) {
-      fs.unlinkSync(devicePath);
-      _deviceIdentity = null;
-      console.log("[device] Removed old format device identity");
-    }
-  } catch { /* File doesn't exist or invalid */ }
-
   // Ensure gateway config is correct on every start (covers existing deployments that
   // onboarded before these settings were added).
   try {
@@ -199,6 +187,30 @@ async function startGateway() {
     await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "--json", "gateway.controlUi.allowInsecureAuth", "true"]));
   } catch (err) {
     console.error(`[gateway] config pre-flight failed (non-fatal): ${String(err)}`);
+  }
+
+  // Belt-and-suspenders: directly patch the config file to ensure gateway.auth.mode=none.
+  // The `config set` CLI command sometimes doesn't persist when the gateway process
+  // holds its own copy of the config.
+  try {
+    const cfgFile = configPath();
+    if (fs.existsSync(cfgFile)) {
+      const raw = fs.readFileSync(cfgFile, "utf8");
+      // Try JSON parse (config is JSON5, but JSON subset works for gateway settings)
+      const cfg = JSON.parse(raw);
+      let changed = false;
+      if (!cfg.gateway) { cfg.gateway = {}; changed = true; }
+      if (!cfg.gateway.auth) { cfg.gateway.auth = {}; changed = true; }
+      if (cfg.gateway.auth.mode !== "none") { cfg.gateway.auth.mode = "none"; changed = true; }
+      if (!cfg.gateway.controlUi) { cfg.gateway.controlUi = {}; changed = true; }
+      if (cfg.gateway.controlUi.allowInsecureAuth !== true) { cfg.gateway.controlUi.allowInsecureAuth = true; changed = true; }
+      if (changed) {
+        fs.writeFileSync(cfgFile, JSON.stringify(cfg, null, 2), "utf8");
+        console.log("[gateway] Patched config file directly: gateway.auth.mode=none");
+      }
+    }
+  } catch (err) {
+    console.error(`[gateway] config file patch failed (non-fatal): ${String(err)}`);
   }
 
   // Gateway listens on loopback only — the wrapper handles all external authentication.
@@ -419,260 +431,76 @@ app.get("/healthz", async (_req, res) => {
   });
 });
 
-// --- OpenClaw gateway WebSocket chat helper ---
-// ---- Device Identity for OpenClaw Gateway (Ed25519) ----
-// The gateway requires device identity even in --auth none mode.
-// We generate a persistent Ed25519 key pair and sign connect params.
-let _deviceIdentity = null;
-
-function getDeviceIdentity() {
-  if (_deviceIdentity) return _deviceIdentity;
-
-  // Try loading from disk (persist across restarts)
-  const devicePath = path.join(STATE_DIR, "device-identity.json");
+// --- Chat helper ---
+// Tries multiple approaches in order:
+// 1. OpenClaw CLI `openclaw chat` (if available) — uses full agent personality/tools/context
+// 2. Anthropic API direct call — reliable fallback, no OpenClaw tools/context
+async function chatViaGateway(message, timeoutMs = 120000) {
+  // Approach 1: Try OpenClaw CLI
   try {
-    const stored = JSON.parse(fs.readFileSync(devicePath, "utf8"));
-    if (stored.version === 2 && stored.publicKeyB64 && stored.privateKeyDer && stored.deviceId) {
-      _deviceIdentity = stored;
-      return _deviceIdentity;
+    // Quick check if `openclaw chat` exists
+    const helpCheck = await runCmd(OPENCLAW_NODE, clawArgs(["chat", "--help"]), { timeoutMs: 5000 });
+    if (helpCheck.code === 0) {
+      console.log(`[chatRelay] Using CLI: openclaw chat`);
+      const result = await runCmd(OPENCLAW_NODE, clawArgs(["chat", "--message", message, "--no-stream"]), { timeoutMs });
+      if (result.code === 0) {
+        const response = (result.output || "").trim();
+        console.log(`[chatRelay] CLI response length: ${response.length}`);
+        return response;
+      }
+      console.warn(`[chatRelay] CLI failed (code=${result.code}): ${(result.output || "").substring(0, 200)}`);
+    } else {
+      console.log(`[chatRelay] openclaw chat not available, trying fallback`);
     }
-  } catch { /* Generate new */ }
-
-  // Generate new Ed25519 key pair
-  const keyPair = crypto.generateKeyPairSync("ed25519");
-
-  // Export full DER for reliable serialization
-  const pubDer = keyPair.publicKey.export({ type: "spki", format: "der" });
-  const privDer = keyPair.privateKey.export({ type: "pkcs8", format: "der" });
-
-  // Extract raw 32-byte public key from SPKI DER (12-byte header for Ed25519)
-  const pubBytes = pubDer.subarray(12);
-  const deviceId = crypto.createHash("sha256").update(pubBytes).digest("hex");
-  const publicKeyB64 = Buffer.from(pubBytes).toString("base64url");
-
-  _deviceIdentity = {
-    version: 2,
-    deviceId,
-    publicKeyB64,
-    privateKeyDer: Buffer.from(privDer).toString("base64url"),
-  };
-
-  try {
-    fs.mkdirSync(path.dirname(devicePath), { recursive: true });
-    fs.writeFileSync(devicePath, JSON.stringify(_deviceIdentity), "utf8");
   } catch (err) {
-    console.error(`[device] Failed to persist identity: ${err}`);
+    console.warn(`[chatRelay] CLI approach failed: ${String(err)}`);
   }
 
-  console.log(`[device] Generated new identity: ${deviceId.substring(0, 16)}...`);
-  return _deviceIdentity;
-}
+  // Approach 2: Anthropic API direct call
+  const apiKey = process.env.ANTHROPIC_API_KEY?.trim();
+  if (!apiKey) {
+    throw new Error("Chat not available: openclaw chat CLI not found and no ANTHROPIC_API_KEY configured");
+  }
 
-function signDevice(device, params, nonce) {
-  const signedAt = Date.now();
-  const version = nonce ? "v2" : "v1";
-  const scopeStr = params.scopes.join(",");
-  const parts = [
-    version, device.deviceId, params.clientId, params.clientMode,
-    params.role, scopeStr, String(signedAt), params.token || "",
-  ];
-  if (version === "v2") parts.push(nonce || "");
+  console.log(`[chatRelay] Using Anthropic API fallback`);
 
-  const message = parts.join("|");
-
-  // Import private key from full PKCS8 DER (no manual header construction)
-  const privDerBuf = Buffer.from(device.privateKeyDer, "base64url");
-  const privateKey = crypto.createPrivateKey({ key: privDerBuf, format: "der", type: "pkcs8" });
-  const signature = crypto.sign(null, Buffer.from(message, "utf8"), privateKey);
-
-  console.log(`[device] Signed message (${version}): ${message.substring(0, 80)}...`);
-  console.log(`[device] Signature (first 20 chars): ${Buffer.from(signature).toString("base64url").substring(0, 20)}...`);
-
-  return {
-    id: device.deviceId,
-    publicKey: device.publicKeyB64,
-    signature: Buffer.from(signature).toString("base64url"),
-    signedAt,
-    nonce: nonce || null,
-  };
-}
-
-// Opens a WebSocket to the internal gateway, sends a message, and collects the response.
-// This ensures the chat goes through OpenClaw with the agent's full personality, tools, and context.
-async function chatViaGateway(message, timeoutMs = 120000) {
-  return new Promise((resolve, reject) => {
-    const wsUrl = `ws://localhost:${INTERNAL_GATEWAY_PORT}/`;
-    const ws = new WebSocket(wsUrl, {
-      headers: {
-        "Origin": `https://localhost:${INTERNAL_GATEWAY_PORT}`,
-        "X-Forwarded-Proto": "https",
-        "Host": "localhost",
-      },
-    });
-    let sessionKey = null;
-    let responseText = "";
-    let chatSent = false;
-    let finished = false;
-    let challengeNonce = null;
-
-    const device = getDeviceIdentity();
-
-    const timer = setTimeout(() => {
-      if (!finished) {
-        finished = true;
-        try { ws.close(); } catch {}
-        if (responseText) resolve(responseText);
-        else reject(new Error("Gateway chat timeout"));
-      }
-    }, timeoutMs);
-
-    function done(result, err) {
-      if (finished) return;
-      finished = true;
-      clearTimeout(timer);
-      try { ws.close(); } catch {}
-      if (err) reject(err);
-      else resolve(result || "");
+  // Load agent system prompt from config if available
+  let systemPrompt = "You are a helpful AI assistant.";
+  try {
+    const cfgFile = configPath();
+    if (fs.existsSync(cfgFile)) {
+      const cfg = JSON.parse(fs.readFileSync(cfgFile, "utf8"));
+      if (cfg.personality?.prompt) systemPrompt = cfg.personality.prompt;
+      else if (cfg.systemPrompt) systemPrompt = cfg.systemPrompt;
+      else if (cfg.agent?.systemPrompt) systemPrompt = cfg.agent.systemPrompt;
     }
+  } catch { /* use default */ }
 
-    ws.on("error", (err) => {
-      console.error(`[chatRelay] WS error: ${err?.message || err}`);
-      done(null, err);
-    });
-    ws.on("close", (code, reason) => {
-      const reasonStr = reason ? reason.toString() : "";
-      console.error(`[chatRelay] WS closed: code=${code} reason=${reasonStr} finished=${finished}`);
-      if (!finished) {
-        if (responseText) done(responseText);
-        else done(null, new Error(`Gateway WS closed: code=${code} reason=${reasonStr}`));
-      }
-    });
-
-    ws.on("open", () => {
-      console.log("[chatRelay] WS connected, sending connect...");
-      setTimeout(() => sendConnect(), 100);
-    });
-
-    const connectParams = {
-      clientId: "openclaw-control-ui",
-      clientMode: "webchat",
-      role: "operator",
-      scopes: ["operator.admin", "operator.approvals", "operator.pairing"],
-      token: "",
-    };
-
-    function sendConnect() {
-      const deviceObj = signDevice(device, connectParams, challengeNonce);
-      ws.send(JSON.stringify({
-        type: "req",
-        id: crypto.randomUUID(),
-        method: "connect",
-        params: {
-          minProtocol: 3,
-          maxProtocol: 3,
-          client: {
-            id: "openclaw-control-ui",
-            version: "1.0.0",
-            platform: "linux",
-            mode: "webchat",
-            instanceId: crypto.randomUUID(),
-          },
-          role: "operator",
-          scopes: ["operator.admin", "operator.approvals", "operator.pairing"],
-          device: deviceObj,
-          auth: { token: process.env.OPENCLAW_GATEWAY_TOKEN || process.env.SETUP_PASSWORD || "", password: process.env.SETUP_PASSWORD || "" },
-          caps: [],
-          userAgent: "XPR-Deploy-ChatRelay/1.0",
-          locale: "en-US",
-        },
-      }));
-    }
-
-    function sendChat() {
-      if (chatSent || !sessionKey) return;
-      chatSent = true;
-      ws.send(JSON.stringify({
-        type: "req",
-        id: crypto.randomUUID(),
-        method: "chat.send",
-        params: {
-          sessionKey,
-          message,
-          deliver: false,
-          idempotencyKey: crypto.randomUUID(),
-        },
-      }));
-    }
-
-    function extractText(msg) {
-      if (!msg) return "";
-      if (typeof msg.content === "string") return msg.content;
-      if (Array.isArray(msg.content)) {
-        return msg.content.filter((b) => b.type === "text").map((b) => b.text || "").join("");
-      }
-      if (msg.text) return msg.text;
-      return "";
-    }
-
-    ws.on("message", (raw) => {
-      try {
-        const rawStr = raw.toString();
-        console.log(`[chatRelay] recv: ${rawStr.substring(0, 300)}`);
-        const msg = JSON.parse(rawStr);
-
-        if (msg.type === "event") {
-          // Challenge-response: capture nonce and re-sign with device identity.
-          if (msg.event === "connect.challenge") {
-            challengeNonce = msg.payload?.nonce || null;
-            sendConnect();
-            return;
-          }
-          // Chat streaming events
-          if (msg.event === "chat" && msg.payload) {
-            const { state, message: chatMsg, errorMessage } = msg.payload;
-            if (state === "delta" && chatMsg) {
-              const text = extractText(chatMsg);
-              if (text.length > responseText.length) responseText = text;
-            }
-            if (state === "final") {
-              const text = chatMsg ? extractText(chatMsg) : "";
-              if (text) responseText = text;
-              done(responseText);
-              return;
-            }
-            if (state === "error") {
-              done(null, new Error(errorMessage || "Chat error from gateway"));
-              return;
-            }
-            if (state === "aborted") {
-              done(responseText || "(response aborted)");
-              return;
-            }
-          }
-        }
-
-        if (msg.type === "res") {
-          if (msg.ok && !sessionKey) {
-            // Extract session key from connect response
-            sessionKey = msg.payload?.snapshot?.sessionDefaults?.mainSessionKey || "main";
-            console.log(`[chatRelay] Connected, sessionKey=${sessionKey}`);
-            sendChat();
-          } else if (!msg.ok && !sessionKey) {
-            const errDetail = JSON.stringify(msg.error || msg).substring(0, 500);
-            console.error(`[chatRelay] Connect failed: ${errDetail}`);
-            done(null, new Error(msg.error?.message || `Gateway connect failed: ${errDetail}`));
-          } else if (!msg.ok && sessionKey) {
-            // chat.send or other request failed
-            const errDetail = JSON.stringify(msg.error || msg).substring(0, 500);
-            console.error(`[chatRelay] Request failed: ${errDetail}`);
-            done(null, new Error(msg.error?.message || `Gateway request failed: ${errDetail}`));
-          }
-        }
-      } catch {
-        // Ignore non-JSON messages
-      }
-    });
+  const resp = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-api-key": apiKey,
+      "anthropic-version": "2023-06-01",
+    },
+    body: JSON.stringify({
+      model: "claude-sonnet-4-20250514",
+      max_tokens: 4096,
+      system: systemPrompt,
+      messages: [{ role: "user", content: message }],
+    }),
+    signal: AbortSignal.timeout(timeoutMs),
   });
+
+  if (!resp.ok) {
+    const errText = await resp.text().catch(() => "");
+    throw new Error(`Anthropic API error ${resp.status}: ${errText.substring(0, 200)}`);
+  }
+
+  const data = await resp.json();
+  const response = data.content?.map(b => b.text).join("") || "";
+  console.log(`[chatRelay] API response length: ${response.length}`);
+  return response;
 }
 
 // --- Chat webhook endpoint for deploy service integration ---
@@ -780,6 +608,7 @@ app.get("/setup", requireSetupAuth, (_req, res) => {
         <option value="openclaw.devices.approve">openclaw devices approve &lt;requestId&gt;</option>
         <option value="openclaw.plugins.list">openclaw plugins list</option>
         <option value="openclaw.plugins.enable">openclaw plugins enable &lt;name&gt;</option>
+        <option value="openclaw.help">openclaw --help</option>
       </select>
       <input id="consoleArg" placeholder="Optional arg (e.g. 200, gateway.port)" style="flex: 1" />
       <button id="consoleRun" style="background:#0f172a">Run</button>
@@ -1342,6 +1171,9 @@ const ALLOWED_CONSOLE_COMMANDS = new Set([
   // Plugin management
   "openclaw.plugins.list",
   "openclaw.plugins.enable",
+
+  // Help / discovery
+  "openclaw.help",
 ]);
 
 app.post("/setup/api/console/run", requireSetupAuth, async (req, res) => {
@@ -1425,6 +1257,11 @@ app.post("/setup/api/console/run", requireSetupAuth, async (req, res) => {
       if (!name) return res.status(400).json({ ok: false, error: "Missing plugin name" });
       if (!/^[A-Za-z0-9_-]+$/.test(name)) return res.status(400).json({ ok: false, error: "Invalid plugin name" });
       const r = await runCmd(OPENCLAW_NODE, clawArgs(["plugins", "enable", name]));
+      return res.status(r.code === 0 ? 200 : 500).json({ ok: r.code === 0, output: redactSecrets(r.output) });
+    }
+
+    if (cmd === "openclaw.help") {
+      const r = await runCmd(OPENCLAW_NODE, clawArgs(["--help"]));
       return res.status(r.code === 0 ? 200 : 500).json({ ok: r.code === 0, output: redactSecrets(r.output) });
     }
 
