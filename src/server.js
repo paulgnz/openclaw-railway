@@ -412,13 +412,20 @@ app.get("/healthz", async (_req, res) => {
 // Tries multiple approaches in order:
 // 1. OpenClaw CLI `openclaw chat` (if available) — uses full agent personality/tools/context
 // 2. Anthropic API direct call — reliable fallback, no OpenClaw tools/context
-async function chatViaGateway(message, timeoutMs = 120000) {
+async function chatViaGateway(message, timeoutMs = 120000, history = []) {
   // Approach 1: Gateway's OpenAI-compatible HTTP API (/v1/chat/completions)
   // This routes through the full gateway — agent gets tools, plugins, and conversation context.
   // Requires gateway.http.endpoints.chatCompletions.enabled = true in config.
   try {
     const gatewayUrl = `${GATEWAY_TARGET}/v1/chat/completions`;
-    console.log(`[chatRelay] Using gateway API: ${gatewayUrl}`);
+
+    // Build messages array: history + current message
+    const messages = [
+      ...history.map((m) => ({ role: m.role, content: m.content })),
+      { role: "user", content: message },
+    ];
+    console.log(`[chatRelay] Using gateway API: ${gatewayUrl} (${messages.length} messages)`);
+
     const resp = await fetch(gatewayUrl, {
       method: "POST",
       headers: {
@@ -428,7 +435,7 @@ async function chatViaGateway(message, timeoutMs = 120000) {
       },
       body: JSON.stringify({
         model: "openclaw",
-        messages: [{ role: "user", content: message }],
+        messages,
       }),
       signal: AbortSignal.timeout(timeoutMs),
     });
@@ -476,7 +483,10 @@ async function chatViaGateway(message, timeoutMs = 120000) {
       model: "claude-sonnet-4-20250514",
       max_tokens: 4096,
       system: systemPrompt,
-      messages: [{ role: "user", content: message }],
+      messages: [
+        ...history.map((m) => ({ role: m.role, content: m.content })),
+        { role: "user", content: message },
+      ],
     }),
     signal: AbortSignal.timeout(timeoutMs),
   });
@@ -509,8 +519,11 @@ app.post("/hooks/agent", async (req, res) => {
 
   const { action, data } = req.body || {};
   if (action !== "chat" || !data?.message || typeof data.message !== "string") {
-    return res.status(400).json({ error: 'Expected { action: "chat", data: { message: string } }' });
+    return res.status(400).json({ error: 'Expected { action: "chat", data: { message: string, history?: array } }' });
   }
+
+  // Extract optional conversation history
+  const history = Array.isArray(data.history) ? data.history.slice(-50) : [];
 
   if (!isConfigured()) {
     return res.status(503).json({ error: "Agent not configured yet" });
@@ -523,7 +536,7 @@ app.post("/hooks/agent", async (req, res) => {
   }
 
   try {
-    const response = await chatViaGateway(data.message.trim());
+    const response = await chatViaGateway(data.message.trim(), 120000, history);
     return res.json({ response });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
