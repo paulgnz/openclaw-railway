@@ -183,7 +183,9 @@ async function startGateway() {
     "--port",
     String(INTERNAL_GATEWAY_PORT),
     "--auth",
-    "none",
+    "token",
+    "--token",
+    OPENCLAW_GATEWAY_TOKEN,
   ];
 
   gatewayProc = childProcess.spawn(OPENCLAW_NODE, clawArgs(args), {
@@ -1485,9 +1487,11 @@ const server = app.listen(PORT, "0.0.0.0", async () => {
       if (result.code === 0 && isConfigured()) {
         console.log("[wrapper] auto-onboarding succeeded");
 
-        // Configure gateway: auth=none (safe because gateway is on loopback only,
-        // wrapper handles all external access)
-        await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.auth.mode", "none"]));
+        // Configure gateway: token auth on loopback (Control UI reads token from config).
+        // Wrapper adds Basic auth as the external-facing layer.
+        await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.auth.mode", "token"]));
+        await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.auth.token", OPENCLAW_GATEWAY_TOKEN]));
+        await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.remote.token", OPENCLAW_GATEWAY_TOKEN]));
         await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.bind", "loopback"]));
         await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.port", String(INTERNAL_GATEWAY_PORT)]));
         await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "--json", "gateway.trustedProxies", JSON.stringify(["127.0.0.1"])]));
