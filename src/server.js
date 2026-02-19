@@ -409,12 +409,82 @@ app.get("/healthz", async (_req, res) => {
 });
 
 // --- OpenClaw gateway WebSocket chat helper ---
+// ---- Device Identity for OpenClaw Gateway (Ed25519) ----
+// The gateway requires device identity even in --auth none mode.
+// We generate a persistent Ed25519 key pair and sign connect params.
+let _deviceIdentity = null;
+
+function getDeviceIdentity() {
+  if (_deviceIdentity) return _deviceIdentity;
+
+  // Try loading from disk (persist across restarts)
+  const devicePath = path.join(STATE_DIR, "device-identity.json");
+  try {
+    const stored = JSON.parse(fs.readFileSync(devicePath, "utf8"));
+    if (stored.version === 1 && stored.publicKey && stored.privateKey && stored.deviceId) {
+      _deviceIdentity = stored;
+      return _deviceIdentity;
+    }
+  } catch { /* Generate new */ }
+
+  // Generate new Ed25519 key pair
+  const keyPair = crypto.generateKeyPairSync("ed25519");
+  const pubRaw = keyPair.publicKey.export({ type: "spki", format: "der" });
+  // DER-encoded SPKI for Ed25519 has 12-byte header, raw key starts at offset 12
+  const pubBytes = pubRaw.subarray(12);
+  const privRaw = keyPair.privateKey.export({ type: "pkcs8", format: "der" });
+  // DER-encoded PKCS8 for Ed25519 has 16-byte header, raw key starts at offset 16
+  const privBytes = privRaw.subarray(16);
+
+  const deviceId = crypto.createHash("sha256").update(pubBytes).digest("hex");
+  const publicKeyB64 = toBase64Url(pubBytes);
+  const privateKeyB64 = toBase64Url(privBytes);
+
+  _deviceIdentity = { version: 1, deviceId, publicKey: publicKeyB64, privateKey: privateKeyB64 };
+
+  try {
+    fs.mkdirSync(path.dirname(devicePath), { recursive: true });
+    fs.writeFileSync(devicePath, JSON.stringify(_deviceIdentity), "utf8");
+  } catch (err) {
+    console.error(`[device] Failed to persist identity: ${err}`);
+  }
+
+  console.log(`[device] Generated new identity: ${deviceId.substring(0, 16)}...`);
+  return _deviceIdentity;
+}
+
+function toBase64Url(buf) {
+  return Buffer.from(buf).toString("base64url");
+}
+
+function signDevice(device, params, nonce) {
+  const signedAt = Date.now();
+  const version = nonce ? "v2" : "v1";
+  const scopeStr = params.scopes.join(",");
+  const parts = [
+    version, device.deviceId, params.clientId, params.clientMode,
+    params.role, scopeStr, String(signedAt), params.token || "",
+  ];
+  if (version === "v2") parts.push(nonce || "");
+
+  const message = parts.join("|");
+  const privBytes = Buffer.from(device.privateKey, "base64url");
+
+  // Reconstruct the private key object from raw bytes
+  const privDer = Buffer.concat([
+    Buffer.from("302e020100300506032b657004220420", "hex"), // PKCS8 Ed25519 header
+    privBytes,
+  ]);
+  const privateKey = crypto.createPrivateKey({ key: privDer, format: "der", type: "pkcs8" });
+  const signature = crypto.sign(null, Buffer.from(message, "utf8"), privateKey);
+
+  return { id: device.deviceId, publicKey: device.publicKey, signature: toBase64Url(signature), signedAt, nonce: nonce || null };
+}
+
 // Opens a WebSocket to the internal gateway, sends a message, and collects the response.
 // This ensures the chat goes through OpenClaw with the agent's full personality, tools, and context.
 async function chatViaGateway(message, timeoutMs = 120000) {
   return new Promise((resolve, reject) => {
-    // Connect to internal gateway. The gateway checks for secure context (HTTPS or localhost).
-    // Set X-Forwarded-Proto: https since gateway trusts 127.0.0.1 as a trusted proxy.
     const wsUrl = `ws://localhost:${INTERNAL_GATEWAY_PORT}/`;
     const ws = new WebSocket(wsUrl, {
       headers: {
@@ -427,6 +497,9 @@ async function chatViaGateway(message, timeoutMs = 120000) {
     let responseText = "";
     let chatSent = false;
     let finished = false;
+    let challengeNonce = null;
+
+    const device = getDeviceIdentity();
 
     const timer = setTimeout(() => {
       if (!finished) {
@@ -455,13 +528,19 @@ async function chatViaGateway(message, timeoutMs = 120000) {
     });
 
     ws.on("open", () => {
-      // Brief delay before sending connect (gateway may need a moment)
       setTimeout(() => sendConnect(), 100);
     });
 
+    const connectParams = {
+      clientId: "openclaw-control-ui",
+      clientMode: "webchat",
+      role: "operator",
+      scopes: ["operator.admin", "operator.approvals", "operator.pairing"],
+      token: null,
+    };
+
     function sendConnect() {
-      // Gateway runs with --auth none on loopback, so no device/token auth needed.
-      // We omit the device object entirely (it would require ECDSA signing).
+      const deviceObj = signDevice(device, connectParams, challengeNonce);
       ws.send(JSON.stringify({
         type: "req",
         id: crypto.randomUUID(),
@@ -474,11 +553,14 @@ async function chatViaGateway(message, timeoutMs = 120000) {
             version: "1.0.0",
             platform: "linux",
             mode: "webchat",
+            instanceId: crypto.randomUUID(),
           },
           role: "operator",
           scopes: ["operator.admin", "operator.approvals", "operator.pairing"],
+          device: deviceObj,
+          auth: { token: null, password: process.env.SETUP_PASSWORD || null },
           caps: [],
-          userAgent: "XPR-Deploy-Dashboard/1.0",
+          userAgent: "XPR-Deploy-ChatRelay/1.0",
           locale: "en-US",
         },
       }));
@@ -515,8 +597,9 @@ async function chatViaGateway(message, timeoutMs = 120000) {
         const msg = JSON.parse(raw.toString());
 
         if (msg.type === "event") {
-          // Challenge-response: with --auth none, just re-send connect without device auth.
+          // Challenge-response: capture nonce and re-sign with device identity.
           if (msg.event === "connect.challenge") {
+            challengeNonce = msg.payload?.nonce || null;
             sendConnect();
             return;
           }
