@@ -412,19 +412,15 @@ app.get("/healthz", async (_req, res) => {
 // Tries multiple approaches in order:
 // 1. OpenClaw CLI `openclaw chat` (if available) — uses full agent personality/tools/context
 // 2. Anthropic API direct call — reliable fallback, no OpenClaw tools/context
-async function chatViaGateway(message, timeoutMs = 120000, history = []) {
+async function chatViaGateway(message, timeoutMs = 120000) {
   // Approach 1: Gateway's OpenAI-compatible HTTP API (/v1/chat/completions)
   // This routes through the full gateway — agent gets tools, plugins, and conversation context.
+  // Uses x-openclaw-session-key for persistent sessions (gateway maintains conversation state).
   // Requires gateway.http.endpoints.chatCompletions.enabled = true in config.
   try {
     const gatewayUrl = `${GATEWAY_TARGET}/v1/chat/completions`;
 
-    // Build messages array: history + current message
-    const messages = [
-      ...history.map((m) => ({ role: m.role, content: m.content })),
-      { role: "user", content: message },
-    ];
-    console.log(`[chatRelay] Using gateway API: ${gatewayUrl} (${messages.length} messages)`);
+    console.log(`[chatRelay] Using gateway API: ${gatewayUrl} (session: agent:main:main)`);
 
     const resp = await fetch(gatewayUrl, {
       method: "POST",
@@ -432,10 +428,11 @@ async function chatViaGateway(message, timeoutMs = 120000, history = []) {
         "Content-Type": "application/json",
         "Authorization": `Bearer ${OPENCLAW_GATEWAY_TOKEN}`,
         "x-openclaw-agent-id": "main",
+        "x-openclaw-session-key": "agent:main:main",
       },
       body: JSON.stringify({
         model: "openclaw",
-        messages,
+        messages: [{ role: "user", content: message }],
       }),
       signal: AbortSignal.timeout(timeoutMs),
     });
@@ -484,7 +481,6 @@ async function chatViaGateway(message, timeoutMs = 120000, history = []) {
       max_tokens: 4096,
       system: systemPrompt,
       messages: [
-        ...history.map((m) => ({ role: m.role, content: m.content })),
         { role: "user", content: message },
       ],
     }),
@@ -502,9 +498,120 @@ async function chatViaGateway(message, timeoutMs = 120000, history = []) {
   return response;
 }
 
+// --- Gateway session history via WebSocket RPC ---
+// Opens a per-request WebSocket to the gateway, authenticates, fetches chat history, then closes.
+async function getGatewayHistory(sessionKey = "agent:main:main", limit = 50) {
+  const WebSocket = (await import("ws")).default;
+  const wsUrl = `ws://${INTERNAL_GATEWAY_HOST}:${INTERNAL_GATEWAY_PORT}`;
+
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      try { ws.close(); } catch {}
+      reject(new Error("Gateway history request timed out"));
+    }, 10_000);
+
+    const ws = new WebSocket(wsUrl);
+    let authenticated = false;
+    let reqId = 1;
+
+    ws.on("open", () => {
+      // Step 1: authenticate
+      ws.send(JSON.stringify({
+        type: "req",
+        id: reqId++,
+        method: "connect",
+        params: { auth: { token: OPENCLAW_GATEWAY_TOKEN } },
+      }));
+    });
+
+    ws.on("message", (data) => {
+      try {
+        const msg = JSON.parse(String(data));
+
+        if (!authenticated && msg.type === "res" && msg.method === "connect") {
+          if (msg.error) {
+            clearTimeout(timeout);
+            ws.close();
+            reject(new Error(`Gateway auth failed: ${msg.error.message || JSON.stringify(msg.error)}`));
+            return;
+          }
+          authenticated = true;
+          // Step 2: fetch history
+          ws.send(JSON.stringify({
+            type: "req",
+            id: reqId++,
+            method: "chat.history",
+            params: { sessionKey, limit },
+          }));
+          return;
+        }
+
+        if (authenticated && msg.type === "res" && msg.method === "chat.history") {
+          clearTimeout(timeout);
+          ws.close();
+          if (msg.error) {
+            reject(new Error(`chat.history error: ${msg.error.message || JSON.stringify(msg.error)}`));
+            return;
+          }
+          resolve(msg.result?.messages || []);
+          return;
+        }
+      } catch (e) {
+        // Ignore parse errors on non-JSON frames
+      }
+    });
+
+    ws.on("error", (err) => {
+      clearTimeout(timeout);
+      reject(err);
+    });
+
+    ws.on("close", () => {
+      clearTimeout(timeout);
+      // If we haven't resolved yet, reject
+    });
+  });
+}
+
+// --- Chat history endpoint for deploy service integration ---
+// Returns the persistent conversation history from the gateway session.
+// Auth: Bearer token (OPENCLAW_HOOK_TOKEN env var).
+app.get("/hooks/chat-history", async (req, res) => {
+  const hookToken = process.env.OPENCLAW_HOOK_TOKEN?.trim();
+  if (!hookToken) {
+    return res.status(500).json({ error: "OPENCLAW_HOOK_TOKEN not configured" });
+  }
+
+  const authHeader = req.headers.authorization || "";
+  if (!authHeader.startsWith("Bearer ") || authHeader.slice(7) !== hookToken) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+
+  if (!isConfigured()) {
+    return res.status(503).json({ error: "Agent not configured yet" });
+  }
+
+  try {
+    await ensureGatewayRunning();
+  } catch (err) {
+    return res.status(503).json({ error: `Gateway not ready: ${String(err)}` });
+  }
+
+  try {
+    const messages = await getGatewayHistory("agent:main:main", 50);
+    return res.json({ messages });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.warn(`[hooks/chat-history] Failed to get history: ${msg}`);
+    // Graceful degradation: return empty history on failure
+    return res.json({ messages: [] });
+  }
+});
+
 // --- Chat webhook endpoint for deploy service integration ---
 // Accepts messages from the deploy dashboard's chat proxy.
 // Routes through OpenClaw gateway so the agent uses its full personality, tools, and context.
+// Uses persistent sessions via x-openclaw-session-key header.
 // Auth: Bearer token (OPENCLAW_HOOK_TOKEN env var).
 app.post("/hooks/agent", async (req, res) => {
   const hookToken = process.env.OPENCLAW_HOOK_TOKEN?.trim();
@@ -519,11 +626,8 @@ app.post("/hooks/agent", async (req, res) => {
 
   const { action, data } = req.body || {};
   if (action !== "chat" || !data?.message || typeof data.message !== "string") {
-    return res.status(400).json({ error: 'Expected { action: "chat", data: { message: string, history?: array } }' });
+    return res.status(400).json({ error: 'Expected { action: "chat", data: { message: string } }' });
   }
-
-  // Extract optional conversation history
-  const history = Array.isArray(data.history) ? data.history.slice(-50) : [];
 
   if (!isConfigured()) {
     return res.status(503).json({ error: "Agent not configured yet" });
@@ -536,7 +640,7 @@ app.post("/hooks/agent", async (req, res) => {
   }
 
   try {
-    const response = await chatViaGateway(data.message.trim(), 120000, history);
+    const response = await chatViaGateway(data.message.trim(), 120000);
     return res.json({ response });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
