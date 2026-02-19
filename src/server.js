@@ -176,6 +176,17 @@ async function startGateway() {
   fs.mkdirSync(STATE_DIR, { recursive: true });
   fs.mkdirSync(WORKSPACE_DIR, { recursive: true });
 
+  // Reset device identity if format changed (force regeneration)
+  const devicePath = path.join(STATE_DIR, "device-identity.json");
+  try {
+    const stored = JSON.parse(fs.readFileSync(devicePath, "utf8"));
+    if (stored.version !== 2) {
+      fs.unlinkSync(devicePath);
+      _deviceIdentity = null;
+      console.log("[device] Removed old format device identity");
+    }
+  } catch { /* File doesn't exist or invalid */ }
+
   // Ensure gateway config is correct on every start (covers existing deployments that
   // onboarded before these settings were added).
   try {
@@ -421,7 +432,7 @@ function getDeviceIdentity() {
   const devicePath = path.join(STATE_DIR, "device-identity.json");
   try {
     const stored = JSON.parse(fs.readFileSync(devicePath, "utf8"));
-    if (stored.version === 1 && stored.publicKey && stored.privateKey && stored.deviceId) {
+    if (stored.version === 2 && stored.publicKeyB64 && stored.privateKeyDer && stored.deviceId) {
       _deviceIdentity = stored;
       return _deviceIdentity;
     }
@@ -429,18 +440,22 @@ function getDeviceIdentity() {
 
   // Generate new Ed25519 key pair
   const keyPair = crypto.generateKeyPairSync("ed25519");
-  const pubRaw = keyPair.publicKey.export({ type: "spki", format: "der" });
-  // DER-encoded SPKI for Ed25519 has 12-byte header, raw key starts at offset 12
-  const pubBytes = pubRaw.subarray(12);
-  const privRaw = keyPair.privateKey.export({ type: "pkcs8", format: "der" });
-  // DER-encoded PKCS8 for Ed25519 has 16-byte header, raw key starts at offset 16
-  const privBytes = privRaw.subarray(16);
 
+  // Export full DER for reliable serialization
+  const pubDer = keyPair.publicKey.export({ type: "spki", format: "der" });
+  const privDer = keyPair.privateKey.export({ type: "pkcs8", format: "der" });
+
+  // Extract raw 32-byte public key from SPKI DER (12-byte header for Ed25519)
+  const pubBytes = pubDer.subarray(12);
   const deviceId = crypto.createHash("sha256").update(pubBytes).digest("hex");
-  const publicKeyB64 = toBase64Url(pubBytes);
-  const privateKeyB64 = toBase64Url(privBytes);
+  const publicKeyB64 = Buffer.from(pubBytes).toString("base64url");
 
-  _deviceIdentity = { version: 1, deviceId, publicKey: publicKeyB64, privateKey: privateKeyB64 };
+  _deviceIdentity = {
+    version: 2,
+    deviceId,
+    publicKeyB64,
+    privateKeyDer: Buffer.from(privDer).toString("base64url"),
+  };
 
   try {
     fs.mkdirSync(path.dirname(devicePath), { recursive: true });
@@ -451,10 +466,6 @@ function getDeviceIdentity() {
 
   console.log(`[device] Generated new identity: ${deviceId.substring(0, 16)}...`);
   return _deviceIdentity;
-}
-
-function toBase64Url(buf) {
-  return Buffer.from(buf).toString("base64url");
 }
 
 function signDevice(device, params, nonce) {
@@ -468,17 +479,22 @@ function signDevice(device, params, nonce) {
   if (version === "v2") parts.push(nonce || "");
 
   const message = parts.join("|");
-  const privBytes = Buffer.from(device.privateKey, "base64url");
 
-  // Reconstruct the private key object from raw bytes
-  const privDer = Buffer.concat([
-    Buffer.from("302e020100300506032b657004220420", "hex"), // PKCS8 Ed25519 header
-    privBytes,
-  ]);
-  const privateKey = crypto.createPrivateKey({ key: privDer, format: "der", type: "pkcs8" });
+  // Import private key from full PKCS8 DER (no manual header construction)
+  const privDerBuf = Buffer.from(device.privateKeyDer, "base64url");
+  const privateKey = crypto.createPrivateKey({ key: privDerBuf, format: "der", type: "pkcs8" });
   const signature = crypto.sign(null, Buffer.from(message, "utf8"), privateKey);
 
-  return { id: device.deviceId, publicKey: device.publicKey, signature: toBase64Url(signature), signedAt, nonce: nonce || null };
+  console.log(`[device] Signed message (${version}): ${message.substring(0, 80)}...`);
+  console.log(`[device] Signature (first 20 chars): ${Buffer.from(signature).toString("base64url").substring(0, 20)}...`);
+
+  return {
+    id: device.deviceId,
+    publicKey: device.publicKeyB64,
+    signature: Buffer.from(signature).toString("base64url"),
+    signedAt,
+    nonce: nonce || null,
+  };
 }
 
 // Opens a WebSocket to the internal gateway, sends a message, and collects the response.
