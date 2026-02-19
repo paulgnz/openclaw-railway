@@ -184,6 +184,8 @@ async function startGateway() {
     await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.port", String(INTERNAL_GATEWAY_PORT)]));
     await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "--json", "gateway.trustedProxies", JSON.stringify(["127.0.0.1"])]));
     await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "--json", "gateway.controlUi.allowedOrigins", JSON.stringify(["*"])]));
+    // Allow insecure (non-TLS) connections — the wrapper handles TLS termination externally.
+    await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "--json", "gateway.controlUi.allowInsecureAuth", "true"]));
   } catch (err) {
     console.error(`[gateway] config pre-flight failed (non-fatal): ${String(err)}`);
   }
@@ -992,6 +994,7 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
     );
     // Allow internal WebSocket connections (chat relay) and all external origins (proxied through wrapper auth)
     await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "--json", "gateway.controlUi.allowedOrigins", JSON.stringify(["*"])]));
+    await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "--json", "gateway.controlUi.allowInsecureAuth", "true"]));
 
     // Optional: configure a custom OpenAI-compatible provider (base URL) for advanced users.
     if (payload.customProviderId?.trim() && payload.customProviderBaseUrl?.trim()) {
@@ -1640,6 +1643,7 @@ const server = app.listen(PORT, "0.0.0.0", async () => {
         await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "--json", "gateway.trustedProxies", JSON.stringify(["127.0.0.1"])]));
         // Allow internal WebSocket connections (chat relay) and all external origins (proxied through wrapper auth)
         await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "--json", "gateway.controlUi.allowedOrigins", JSON.stringify(["*"])]));
+        await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "--json", "gateway.controlUi.allowInsecureAuth", "true"]));
 
         // Optional channels from env vars
         if (process.env.TELEGRAM_BOT_TOKEN?.trim()) {
