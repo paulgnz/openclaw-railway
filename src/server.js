@@ -1576,6 +1576,20 @@ server.on("upgrade", async (req, socket, head) => {
     socket.destroy();
     return;
   }
+
+  // Inject the gateway token into the proxied WebSocket URL so the OpenClaw gateway
+  // accepts the connection. The user already authenticated with the wrapper (Basic auth),
+  // so this transparently bridges external auth → internal gateway auth.
+  try {
+    const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
+    if (!url.searchParams.has("token") && OPENCLAW_GATEWAY_TOKEN) {
+      url.searchParams.set("token", OPENCLAW_GATEWAY_TOKEN);
+      req.url = url.pathname + url.search;
+    }
+  } catch {
+    // ignore parse errors
+  }
+
   proxy.ws(req, socket, head, { target: GATEWAY_TARGET });
 });
 
