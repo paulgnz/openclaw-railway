@@ -438,28 +438,28 @@ async function chatViaGateway(message, timeoutMs = 120000) {
     });
 
     function sendConnect(nonce) {
-      const req = {
-        type: "req",
-        id: crypto.randomUUID(),
-        method: "connect",
-        params: {
-          minProtocol: 3,
-          maxProtocol: 3,
-          client: {
-            id: "deploy-dashboard-chat",
-            version: "1.0",
-            platform: "server",
-            mode: "webchat",
-          },
-          role: "operator",
-          scopes: ["operator.admin"],
-          caps: [],
-          userAgent: "XPR-Deploy-Dashboard/1.0",
-          locale: "en-US",
-          ...(nonce ? { nonce } : {}),
+      const params = {
+        minProtocol: 3,
+        maxProtocol: 3,
+        client: {
+          id: "openclaw-control-ui",
+          version: "1.0.0",
+          platform: "linux",
+          mode: "webchat",
         },
+        role: "operator",
+        scopes: ["operator.admin", "operator.approvals", "operator.pairing"],
+        caps: [],
+        userAgent: "XPR-Deploy-Dashboard/1.0",
+        locale: "en-US",
       };
-      ws.send(JSON.stringify(req));
+
+      // If gateway sends a challenge nonce, include it in the device object
+      if (nonce) {
+        params.device = { nonce };
+      }
+
+      ws.send(JSON.stringify({ type: "req", id: crypto.randomUUID(), method: "connect", params }));
     }
 
     function sendChat() {
