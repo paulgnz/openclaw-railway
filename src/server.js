@@ -7,6 +7,7 @@ import path from "node:path";
 import express from "express";
 import httpProxy from "http-proxy";
 import * as tar from "tar";
+import WebSocket from "ws";
 
 // Migrate deprecated CLAWDBOT_* env vars → OPENCLAW_* so existing Railway deployments
 // keep working. Users should update their Railway Variables to use the new names.
@@ -175,6 +176,8 @@ async function startGateway() {
   fs.mkdirSync(STATE_DIR, { recursive: true });
   fs.mkdirSync(WORKSPACE_DIR, { recursive: true });
 
+  // Gateway listens on loopback only — the wrapper handles all external authentication.
+  // Using --auth none eliminates the challenge-response requirement that causes 1008 disconnects.
   const args = [
     "gateway",
     "run",
@@ -183,9 +186,7 @@ async function startGateway() {
     "--port",
     String(INTERNAL_GATEWAY_PORT),
     "--auth",
-    "token",
-    "--token",
-    OPENCLAW_GATEWAY_TOKEN,
+    "none",
   ];
 
   gatewayProc = childProcess.spawn(OPENCLAW_NODE, clawArgs(args), {
@@ -393,8 +394,154 @@ app.get("/healthz", async (_req, res) => {
   });
 });
 
+// --- OpenClaw gateway WebSocket chat helper ---
+// Opens a WebSocket to the internal gateway, sends a message, and collects the response.
+// This ensures the chat goes through OpenClaw with the agent's full personality, tools, and context.
+async function chatViaGateway(message, timeoutMs = 120000) {
+  return new Promise((resolve, reject) => {
+    const wsUrl = `ws://${INTERNAL_GATEWAY_HOST}:${INTERNAL_GATEWAY_PORT}/`;
+    const ws = new WebSocket(wsUrl);
+    let sessionKey = null;
+    let responseText = "";
+    let chatSent = false;
+    let finished = false;
+
+    const timer = setTimeout(() => {
+      if (!finished) {
+        finished = true;
+        try { ws.close(); } catch {}
+        if (responseText) resolve(responseText);
+        else reject(new Error("Gateway chat timeout"));
+      }
+    }, timeoutMs);
+
+    function done(result, err) {
+      if (finished) return;
+      finished = true;
+      clearTimeout(timer);
+      try { ws.close(); } catch {}
+      if (err) reject(err);
+      else resolve(result || "");
+    }
+
+    ws.on("error", (err) => done(null, err));
+    ws.on("close", () => {
+      if (!finished) {
+        if (responseText) done(responseText);
+        else done(null, new Error("Gateway WebSocket closed unexpectedly"));
+      }
+    });
+
+    ws.on("open", () => {
+      // Brief delay before sending connect (gateway may need a moment)
+      setTimeout(() => sendConnect(), 100);
+    });
+
+    function sendConnect(nonce) {
+      const req = {
+        type: "req",
+        id: crypto.randomUUID(),
+        method: "connect",
+        params: {
+          minProtocol: 3,
+          maxProtocol: 3,
+          client: {
+            id: "deploy-dashboard-chat",
+            version: "1.0",
+            platform: "server",
+            mode: "webchat",
+          },
+          role: "operator",
+          scopes: ["operator.admin"],
+          caps: [],
+          userAgent: "XPR-Deploy-Dashboard/1.0",
+          locale: "en-US",
+          ...(nonce ? { nonce } : {}),
+        },
+      };
+      ws.send(JSON.stringify(req));
+    }
+
+    function sendChat() {
+      if (chatSent || !sessionKey) return;
+      chatSent = true;
+      ws.send(JSON.stringify({
+        type: "req",
+        id: crypto.randomUUID(),
+        method: "chat.send",
+        params: {
+          sessionKey,
+          message,
+          deliver: false,
+          idempotencyKey: crypto.randomUUID(),
+        },
+      }));
+    }
+
+    function extractText(msg) {
+      if (!msg) return "";
+      if (typeof msg.content === "string") return msg.content;
+      if (Array.isArray(msg.content)) {
+        return msg.content.filter((b) => b.type === "text").map((b) => b.text || "").join("");
+      }
+      if (msg.text) return msg.text;
+      return "";
+    }
+
+    ws.on("message", (raw) => {
+      try {
+        const msg = JSON.parse(raw.toString());
+
+        if (msg.type === "event") {
+          // Challenge-response (unlikely with --auth none, but defensive)
+          if (msg.event === "connect.challenge" && msg.payload?.nonce) {
+            sendConnect(msg.payload.nonce);
+            return;
+          }
+          // Chat streaming events
+          if (msg.event === "chat" && msg.payload) {
+            const { state, message: chatMsg, errorMessage } = msg.payload;
+            if (state === "delta" && chatMsg) {
+              const text = extractText(chatMsg);
+              if (text.length > responseText.length) responseText = text;
+            }
+            if (state === "final") {
+              const text = chatMsg ? extractText(chatMsg) : "";
+              if (text) responseText = text;
+              done(responseText);
+              return;
+            }
+            if (state === "error") {
+              done(null, new Error(errorMessage || "Chat error from gateway"));
+              return;
+            }
+            if (state === "aborted") {
+              done(responseText || "(response aborted)");
+              return;
+            }
+          }
+        }
+
+        if (msg.type === "res") {
+          if (msg.ok && !sessionKey) {
+            // Extract session key from connect response
+            sessionKey = msg.payload?.snapshot?.sessionDefaults?.mainSessionKey || "main";
+            sendChat();
+          } else if (!msg.ok && !sessionKey) {
+            done(null, new Error(msg.error?.message || "Gateway connect failed"));
+          }
+          // chat.send ack and other responses are ignored
+        }
+      } catch {
+        // Ignore non-JSON messages
+      }
+    });
+  });
+}
+
 // --- Chat webhook endpoint for deploy service integration ---
 // Accepts messages from the deploy dashboard's chat proxy.
+// Routes through OpenClaw gateway so the agent uses its full personality, tools, and context.
 // Auth: Bearer token (OPENCLAW_HOOK_TOKEN env var).
 app.post("/hooks/agent", async (req, res) => {
   const hookToken = process.env.OPENCLAW_HOOK_TOKEN?.trim();
@@ -409,42 +556,25 @@ app.post("/hooks/agent", async (req, res) => {
 
   const { action, data } = req.body || {};
   if (action !== "chat" || !data?.message || typeof data.message !== "string") {
-    return res.status(400).json({ error: "Expected { action: 'chat', data: { message: string } }" });
+    return res.status(400).json({ error: 'Expected { action: "chat", data: { message: string } }' });
   }
 
-  const apiKey = process.env.ANTHROPIC_API_KEY?.trim();
-  if (!apiKey) {
-    return res.status(500).json({ error: "ANTHROPIC_API_KEY not configured" });
+  if (!isConfigured()) {
+    return res.status(503).json({ error: "Agent not configured yet" });
   }
 
   try {
-    const apiRes = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": apiKey,
-        "anthropic-version": "2023-06-01",
-      },
-      body: JSON.stringify({
-        model: "claude-sonnet-4-20250514",
-        max_tokens: 1024,
-        messages: [{ role: "user", content: data.message.trim() }],
-      }),
-      signal: AbortSignal.timeout(60000),
-    });
+    await ensureGatewayRunning();
+  } catch (err) {
+    return res.status(503).json({ error: `Gateway not ready: ${String(err)}` });
+  }
 
-    if (!apiRes.ok) {
-      const errBody = await apiRes.text().catch(() => "");
-      console.error(`[hooks/agent] Anthropic API ${apiRes.status}: ${errBody.slice(0, 200)}`);
-      return res.status(502).json({ error: `Anthropic API error: ${apiRes.status}` });
-    }
-
-    const result = await apiRes.json();
-    const text = result.content?.[0]?.text || "";
-    return res.json({ response: text });
+  try {
+    const response = await chatViaGateway(data.message.trim());
+    return res.json({ response });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    console.error(`[hooks/agent] Error: ${msg}`);
+    console.error(`[hooks/agent] Chat error: ${msg}`);
     return res.status(500).json({ error: msg });
   }
 });
@@ -700,15 +830,13 @@ function buildOnboardArgs(payload) {
     "--skip-health",
     "--workspace",
     WORKSPACE_DIR,
-    // The wrapper owns public networking; keep the gateway internal.
+    // The wrapper owns public networking and authentication; keep the gateway internal with no auth.
     "--gateway-bind",
     "loopback",
     "--gateway-port",
     String(INTERNAL_GATEWAY_PORT),
     "--gateway-auth",
-    "token",
-    "--gateway-token",
-    OPENCLAW_GATEWAY_TOKEN,
+    "none",
     "--flow",
     payload.flow || "quickstart",
   ];
@@ -831,13 +959,8 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
 
   // Optional setup (only after successful onboarding).
   if (ok) {
-    // Ensure gateway token is written into config so the browser UI can authenticate reliably.
-    // (We also enforce loopback bind since the wrapper proxies externally.)
-    // IMPORTANT: Set both gateway.auth.token (server-side) and gateway.remote.token (client-side)
-    // to the same value so the Control UI can connect without "token mismatch" errors.
-    await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.auth.mode", "token"]));
-    await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.auth.token", OPENCLAW_GATEWAY_TOKEN]));
-    await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.remote.token", OPENCLAW_GATEWAY_TOKEN]));
+    // Gateway runs on loopback with no auth — the wrapper handles all external authentication.
+    await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.auth.mode", "none"]));
     await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.bind", "loopback"]));
     await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.port", String(INTERNAL_GATEWAY_PORT)]));
 
@@ -1445,7 +1568,8 @@ app.use(async (req, res) => {
     }
   }
 
-  // Gateway runs with --auth none on loopback, so proxy directly.
+  // Gateway runs with --auth none on loopback — proxy directly.
+  // External auth is handled by the requireWrapperAuth middleware.
   return proxy.web(req, res, { target: GATEWAY_TARGET });
 });
 
@@ -1487,11 +1611,8 @@ const server = app.listen(PORT, "0.0.0.0", async () => {
       if (result.code === 0 && isConfigured()) {
         console.log("[wrapper] auto-onboarding succeeded");
 
-        // Configure gateway: token auth on loopback (Control UI reads token from config).
-        // Wrapper adds Basic auth as the external-facing layer.
-        await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.auth.mode", "token"]));
-        await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.auth.token", OPENCLAW_GATEWAY_TOKEN]));
-        await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.remote.token", OPENCLAW_GATEWAY_TOKEN]));
+        // Gateway runs on loopback with no auth — the wrapper handles all external authentication.
+        await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.auth.mode", "none"]));
         await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.bind", "loopback"]));
         await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.port", String(INTERNAL_GATEWAY_PORT)]));
         await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "--json", "gateway.trustedProxies", JSON.stringify(["127.0.0.1"])]));
@@ -1577,19 +1698,8 @@ server.on("upgrade", async (req, socket, head) => {
     return;
   }
 
-  // Inject the gateway token into the proxied WebSocket URL so the OpenClaw gateway
-  // accepts the connection. The user already authenticated with the wrapper (Basic auth),
-  // so this transparently bridges external auth → internal gateway auth.
-  try {
-    const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
-    if (!url.searchParams.has("token") && OPENCLAW_GATEWAY_TOKEN) {
-      url.searchParams.set("token", OPENCLAW_GATEWAY_TOKEN);
-      req.url = url.pathname + url.search;
-    }
-  } catch {
-    // ignore parse errors
-  }
-
+  // Gateway runs with --auth none on loopback — no token injection needed.
+  // The wrapper already authenticated the external user above.
   proxy.ws(req, socket, head, { target: GATEWAY_TARGET });
 });
 
