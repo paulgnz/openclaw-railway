@@ -294,6 +294,48 @@ const app = express();
 app.disable("x-powered-by");
 app.use(express.json({ limit: "1mb" }));
 
+// --- Global auth middleware ---
+// Protects ALL routes except health checks and /setup (which has its own auth).
+// Supports: Basic auth (password = SETUP_PASSWORD), Bearer token, or ?token= query param.
+function requireWrapperAuth(req, res, next) {
+  // Always allow health endpoints and setup pages (setup has its own requireSetupAuth).
+  if (req.path === "/healthz" || req.path === "/setup/healthz") return next();
+  if (req.path.startsWith("/setup")) return next();
+  // Allow the /hooks/ endpoint (it uses Bearer token auth, checked in the handler).
+  if (req.path.startsWith("/hooks/")) return next();
+
+  // If no SETUP_PASSWORD is configured, skip auth (development mode).
+  if (!SETUP_PASSWORD) return next();
+
+  const authHeader = req.headers.authorization || "";
+
+  // Basic auth
+  if (authHeader.startsWith("Basic ")) {
+    const decoded = Buffer.from(authHeader.slice(6), "base64").toString("utf8");
+    const password = decoded.slice(decoded.indexOf(":") + 1);
+    if (password === SETUP_PASSWORD) return next();
+  }
+
+  // Bearer token
+  if (authHeader.startsWith("Bearer ") && authHeader.slice(7) === SETUP_PASSWORD) {
+    return next();
+  }
+
+  // Query param token
+  try {
+    const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
+    const tokenParam = url.searchParams.get("token");
+    if (tokenParam && tokenParam === SETUP_PASSWORD) return next();
+  } catch {
+    // ignore parse errors
+  }
+
+  res.set("WWW-Authenticate", 'Basic realm="Agent"');
+  return res.status(401).send("Unauthorized");
+}
+
+app.use(requireWrapperAuth);
+
 // Minimal health endpoint for Railway.
 app.get("/setup/healthz", (_req, res) => res.json({ ok: true }));
 
@@ -347,6 +389,62 @@ app.get("/healthz", async (_req, res) => {
       lastDoctorAt,
     },
   });
+});
+
+// --- Chat webhook endpoint for deploy service integration ---
+// Accepts messages from the deploy dashboard's chat proxy.
+// Auth: Bearer token (OPENCLAW_HOOK_TOKEN env var).
+app.post("/hooks/agent", async (req, res) => {
+  const hookToken = process.env.OPENCLAW_HOOK_TOKEN?.trim();
+  if (!hookToken) {
+    return res.status(500).json({ error: "OPENCLAW_HOOK_TOKEN not configured" });
+  }
+
+  const authHeader = req.headers.authorization || "";
+  if (!authHeader.startsWith("Bearer ") || authHeader.slice(7) !== hookToken) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+
+  const { action, data } = req.body || {};
+  if (action !== "chat" || !data?.message || typeof data.message !== "string") {
+    return res.status(400).json({ error: "Expected { action: 'chat', data: { message: string } }" });
+  }
+
+  const apiKey = process.env.ANTHROPIC_API_KEY?.trim();
+  if (!apiKey) {
+    return res.status(500).json({ error: "ANTHROPIC_API_KEY not configured" });
+  }
+
+  try {
+    const apiRes = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: "claude-sonnet-4-20250514",
+        max_tokens: 1024,
+        messages: [{ role: "user", content: data.message.trim() }],
+      }),
+      signal: AbortSignal.timeout(60000),
+    });
+
+    if (!apiRes.ok) {
+      const errBody = await apiRes.text().catch(() => "");
+      console.error(`[hooks/agent] Anthropic API ${apiRes.status}: ${errBody.slice(0, 200)}`);
+      return res.status(502).json({ error: `Anthropic API error: ${apiRes.status}` });
+    }
+
+    const result = await apiRes.json();
+    const text = result.content?.[0]?.text || "";
+    return res.json({ response: text });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`[hooks/agent] Error: ${msg}`);
+    return res.status(500).json({ error: msg });
+  }
 });
 
 app.get("/setup/app.js", requireSetupAuth, (_req, res) => {
@@ -1327,22 +1425,7 @@ app.use(async (req, res) => {
     return res.redirect("/setup");
   }
 
-  // Protect the Control UI with SETUP_PASSWORD (Basic auth).
-  // Gateway runs --auth none on loopback, so the wrapper is the auth layer.
-  if (SETUP_PASSWORD && !req.path.startsWith("/setup") && req.path !== "/healthz") {
-    const authHeader = req.headers.authorization || "";
-    if (authHeader.startsWith("Basic ")) {
-      const decoded = Buffer.from(authHeader.slice(6), "base64").toString("utf8");
-      const password = decoded.slice(decoded.indexOf(":") + 1);
-      if (password !== SETUP_PASSWORD) {
-        res.set("WWW-Authenticate", 'Basic realm="Agent"');
-        return res.status(401).send("Unauthorized");
-      }
-    } else {
-      res.set("WWW-Authenticate", 'Basic realm="Agent"');
-      return res.status(401).send("Unauthorized");
-    }
-  }
+  // Auth is handled by the global requireWrapperAuth middleware above.
 
   if (isConfigured()) {
     try {
@@ -1448,19 +1531,36 @@ server.on("upgrade", async (req, socket, head) => {
     return;
   }
 
-  // Authenticate WebSocket upgrades with SETUP_PASSWORD via Basic auth.
-  // Browsers send auth headers on WebSocket upgrades when the page was authed with Basic.
+  // Authenticate WebSocket upgrades.
+  // Supports: Basic auth (browser sends it after page auth), Bearer token, or ?token= query param.
   if (SETUP_PASSWORD) {
+    let authed = false;
     const authHeader = req.headers.authorization || "";
+
+    // Basic auth (browser auto-sends after page auth)
     if (authHeader.startsWith("Basic ")) {
       const decoded = Buffer.from(authHeader.slice(6), "base64").toString("utf8");
       const password = decoded.slice(decoded.indexOf(":") + 1);
-      if (password !== SETUP_PASSWORD) {
-        socket.destroy();
-        return;
+      if (password === SETUP_PASSWORD) authed = true;
+    }
+
+    // Bearer token
+    if (!authed && authHeader.startsWith("Bearer ") && authHeader.slice(7) === SETUP_PASSWORD) {
+      authed = true;
+    }
+
+    // Query param token (e.g. ws://host/?token=XXX)
+    if (!authed) {
+      try {
+        const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
+        const tokenParam = url.searchParams.get("token");
+        if (tokenParam && tokenParam === SETUP_PASSWORD) authed = true;
+      } catch {
+        // ignore
       }
-    } else {
-      // No auth header — reject
+    }
+
+    if (!authed) {
       socket.destroy();
       return;
     }
