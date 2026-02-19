@@ -597,15 +597,10 @@ app.get("/hooks/chat-history", async (req, res) => {
     return res.status(503).json({ error: `Gateway not ready: ${String(err)}` });
   }
 
-  try {
-    const messages = await getGatewayHistory("agent:main:main", 50);
-    return res.json({ messages });
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    console.warn(`[hooks/chat-history] Failed to get history: ${msg}`);
-    // Graceful degradation: return empty history on failure
-    return res.json({ messages: [] });
-  }
+  // Gateway WS RPC chat.history is not available in current OpenClaw version.
+  // Return empty — gateway still maintains session context for agent responses
+  // via x-openclaw-session-key header on the chat endpoint.
+  return res.json({ messages: [] });
 });
 
 // --- Chat webhook endpoint for deploy service integration ---
