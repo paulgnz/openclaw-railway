@@ -413,24 +413,26 @@ app.get("/healthz", async (_req, res) => {
 // 1. OpenClaw CLI `openclaw chat` (if available) — uses full agent personality/tools/context
 // 2. Anthropic API direct call — reliable fallback, no OpenClaw tools/context
 async function chatViaGateway(message, timeoutMs = 120000) {
-  // Approach 1: Try OpenClaw CLI
+  // Approach 1: Try `openclaw agent` CLI (runs a full agent turn through the Gateway)
   try {
-    // Quick check if `openclaw chat` exists
-    const helpCheck = await runCmd(OPENCLAW_NODE, clawArgs(["chat", "--help"]), { timeoutMs: 5000 });
-    if (helpCheck.code === 0) {
-      console.log(`[chatRelay] Using CLI: openclaw chat`);
-      const result = await runCmd(OPENCLAW_NODE, clawArgs(["chat", "--message", message, "--no-stream"]), { timeoutMs });
-      if (result.code === 0) {
-        const response = (result.output || "").trim();
-        console.log(`[chatRelay] CLI response length: ${response.length}`);
-        return response;
+    const agentArgs = ["agent", "--message", message, "--local", "--json"];
+    console.log(`[chatRelay] Using CLI: openclaw agent --message "${message.substring(0, 50)}..."`);
+    const result = await runCmd(OPENCLAW_NODE, clawArgs(agentArgs), { timeoutMs });
+    if (result.code === 0 && result.output?.trim()) {
+      // The agent command may output JSON with the response
+      let response = (result.output || "").trim();
+      try {
+        const parsed = JSON.parse(response);
+        response = parsed.response || parsed.text || parsed.content || parsed.message || response;
+      } catch {
+        // Not JSON — use raw output (may be plain text)
       }
-      console.warn(`[chatRelay] CLI failed (code=${result.code}): ${(result.output || "").substring(0, 200)}`);
-    } else {
-      console.log(`[chatRelay] openclaw chat not available, trying fallback`);
+      console.log(`[chatRelay] Agent CLI response length: ${response.length}`);
+      return response;
     }
+    console.warn(`[chatRelay] Agent CLI failed (code=${result.code}): ${(result.output || "").substring(0, 300)}`);
   } catch (err) {
-    console.warn(`[chatRelay] CLI approach failed: ${String(err)}`);
+    console.warn(`[chatRelay] Agent CLI approach failed: ${String(err)}`);
   }
 
   // Approach 2: Anthropic API direct call
