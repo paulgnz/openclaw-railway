@@ -183,9 +183,7 @@ async function startGateway() {
     "--port",
     String(INTERNAL_GATEWAY_PORT),
     "--auth",
-    "token",
-    "--token",
-    OPENCLAW_GATEWAY_TOKEN,
+    "none",
   ];
 
   gatewayProc = childProcess.spawn(OPENCLAW_NODE, clawArgs(args), {
@@ -1329,6 +1327,23 @@ app.use(async (req, res) => {
     return res.redirect("/setup");
   }
 
+  // Protect the Control UI with SETUP_PASSWORD (Basic auth).
+  // Gateway runs --auth none on loopback, so the wrapper is the auth layer.
+  if (SETUP_PASSWORD && !req.path.startsWith("/setup") && req.path !== "/healthz") {
+    const authHeader = req.headers.authorization || "";
+    if (authHeader.startsWith("Basic ")) {
+      const decoded = Buffer.from(authHeader.slice(6), "base64").toString("utf8");
+      const password = decoded.slice(decoded.indexOf(":") + 1);
+      if (password !== SETUP_PASSWORD) {
+        res.set("WWW-Authenticate", 'Basic realm="Agent"');
+        return res.status(401).send("Unauthorized");
+      }
+    } else {
+      res.set("WWW-Authenticate", 'Basic realm="Agent"');
+      return res.status(401).send("Unauthorized");
+    }
+  }
+
   if (isConfigured()) {
     try {
       await ensureGatewayRunning();
@@ -1345,9 +1360,7 @@ app.use(async (req, res) => {
     }
   }
 
-  // Inject gateway token into the request URL so the gateway authenticates the proxied request.
-  const httpSep = req.url.includes("?") ? "&" : "?";
-  req.url = `${req.url}${httpSep}token=${encodeURIComponent(OPENCLAW_GATEWAY_TOKEN)}`;
+  // Gateway runs with --auth none on loopback, so proxy directly.
   return proxy.web(req, res, { target: GATEWAY_TARGET });
 });
 
@@ -1389,10 +1402,9 @@ const server = app.listen(PORT, "0.0.0.0", async () => {
       if (result.code === 0 && isConfigured()) {
         console.log("[wrapper] auto-onboarding succeeded");
 
-        // Configure gateway token and loopback binding (same as /setup/api/run)
-        await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.auth.mode", "token"]));
-        await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.auth.token", OPENCLAW_GATEWAY_TOKEN]));
-        await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.remote.token", OPENCLAW_GATEWAY_TOKEN]));
+        // Configure gateway: auth=none (safe because gateway is on loopback only,
+        // wrapper handles all external access)
+        await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.auth.mode", "none"]));
         await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.bind", "loopback"]));
         await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.port", String(INTERNAL_GATEWAY_PORT)]));
         await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "--json", "gateway.trustedProxies", JSON.stringify(["127.0.0.1"])]));
@@ -1435,17 +1447,31 @@ server.on("upgrade", async (req, socket, head) => {
     socket.destroy();
     return;
   }
+
+  // Authenticate WebSocket upgrades with SETUP_PASSWORD via Basic auth.
+  // Browsers send auth headers on WebSocket upgrades when the page was authed with Basic.
+  if (SETUP_PASSWORD) {
+    const authHeader = req.headers.authorization || "";
+    if (authHeader.startsWith("Basic ")) {
+      const decoded = Buffer.from(authHeader.slice(6), "base64").toString("utf8");
+      const password = decoded.slice(decoded.indexOf(":") + 1);
+      if (password !== SETUP_PASSWORD) {
+        socket.destroy();
+        return;
+      }
+    } else {
+      // No auth header — reject
+      socket.destroy();
+      return;
+    }
+  }
+
   try {
     await ensureGatewayRunning();
   } catch {
     socket.destroy();
     return;
   }
-  // Inject gateway token into the request URL so the gateway authenticates
-  // the proxied connection. Without this, the gateway returns 1008 "token missing".
-  // http-proxy preserves req.url when forwarding, so we modify it directly.
-  const wsSep = req.url.includes("?") ? "&" : "?";
-  req.url = `${req.url}${wsSep}token=${encodeURIComponent(OPENCLAW_GATEWAY_TOKEN)}`;
   proxy.ws(req, socket, head, { target: GATEWAY_TARGET });
 });
 
