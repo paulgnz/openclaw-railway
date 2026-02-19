@@ -919,6 +919,9 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
     await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "--json", "gateway.controlUi.allowedOrigins", JSON.stringify(["*"])]));
     await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "--json", "gateway.controlUi.allowInsecureAuth", "true"]));
 
+    // Enable gateway restart command so plugins/skills can restart the gateway after install
+    await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "--json", "commands.restart", "true"]));
+
     // Optional: configure a custom OpenAI-compatible provider (base URL) for advanced users.
     if (payload.customProviderId?.trim() && payload.customProviderBaseUrl?.trim()) {
       const providerId = payload.customProviderId.trim();
@@ -1576,6 +1579,9 @@ const server = app.listen(PORT, "0.0.0.0", async () => {
         // Allow internal WebSocket connections (chat relay) and all external origins (proxied through wrapper auth)
         await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "--json", "gateway.controlUi.allowedOrigins", JSON.stringify(["*"])]));
         await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "--json", "gateway.controlUi.allowInsecureAuth", "true"]));
+
+        // Enable gateway restart command so plugins/skills can restart the gateway after install
+        await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "--json", "commands.restart", "true"]));
 
         // Optional channels from env vars
         if (process.env.TELEGRAM_BOT_TOKEN?.trim()) {
