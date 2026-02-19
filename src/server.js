@@ -536,7 +536,7 @@ async function chatViaGateway(message, timeoutMs = 120000) {
       clientMode: "webchat",
       role: "operator",
       scopes: ["operator.admin", "operator.approvals", "operator.pairing"],
-      token: null,
+      token: "",
     };
 
     function sendConnect() {
@@ -558,7 +558,7 @@ async function chatViaGateway(message, timeoutMs = 120000) {
           role: "operator",
           scopes: ["operator.admin", "operator.approvals", "operator.pairing"],
           device: deviceObj,
-          auth: { token: null, password: process.env.SETUP_PASSWORD || null },
+          auth: { token: "", password: process.env.SETUP_PASSWORD || "" },
           caps: [],
           userAgent: "XPR-Deploy-ChatRelay/1.0",
           locale: "en-US",
