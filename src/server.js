@@ -519,15 +519,21 @@ async function chatViaGateway(message, timeoutMs = 120000) {
       else resolve(result || "");
     }
 
-    ws.on("error", (err) => done(null, err));
-    ws.on("close", () => {
+    ws.on("error", (err) => {
+      console.error(`[chatRelay] WS error: ${err?.message || err}`);
+      done(null, err);
+    });
+    ws.on("close", (code, reason) => {
+      const reasonStr = reason ? reason.toString() : "";
+      console.error(`[chatRelay] WS closed: code=${code} reason=${reasonStr} finished=${finished}`);
       if (!finished) {
         if (responseText) done(responseText);
-        else done(null, new Error("Gateway WebSocket closed unexpectedly"));
+        else done(null, new Error(`Gateway WS closed: code=${code} reason=${reasonStr}`));
       }
     });
 
     ws.on("open", () => {
+      console.log("[chatRelay] WS connected, sending connect...");
       setTimeout(() => sendConnect(), 100);
     });
 
@@ -594,7 +600,9 @@ async function chatViaGateway(message, timeoutMs = 120000) {
 
     ws.on("message", (raw) => {
       try {
-        const msg = JSON.parse(raw.toString());
+        const rawStr = raw.toString();
+        console.log(`[chatRelay] recv: ${rawStr.substring(0, 300)}`);
+        const msg = JSON.parse(rawStr);
 
         if (msg.type === "event") {
           // Challenge-response: capture nonce and re-sign with device identity.
