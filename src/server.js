@@ -631,11 +631,18 @@ async function chatViaGateway(message, timeoutMs = 120000) {
           if (msg.ok && !sessionKey) {
             // Extract session key from connect response
             sessionKey = msg.payload?.snapshot?.sessionDefaults?.mainSessionKey || "main";
+            console.log(`[chatRelay] Connected, sessionKey=${sessionKey}`);
             sendChat();
           } else if (!msg.ok && !sessionKey) {
-            done(null, new Error(msg.error?.message || "Gateway connect failed"));
+            const errDetail = JSON.stringify(msg.error || msg).substring(0, 500);
+            console.error(`[chatRelay] Connect failed: ${errDetail}`);
+            done(null, new Error(msg.error?.message || `Gateway connect failed: ${errDetail}`));
+          } else if (!msg.ok && sessionKey) {
+            // chat.send or other request failed
+            const errDetail = JSON.stringify(msg.error || msg).substring(0, 500);
+            console.error(`[chatRelay] Request failed: ${errDetail}`);
+            done(null, new Error(msg.error?.message || `Gateway request failed: ${errDetail}`));
           }
-          // chat.send ack and other responses are ignored
         }
       } catch {
         // Ignore non-JSON messages
