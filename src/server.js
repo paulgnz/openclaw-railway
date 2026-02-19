@@ -177,8 +177,9 @@ async function startGateway() {
 
   // Ensure gateway config is correct on every start (covers existing deployments that
   // onboarded before these settings were added).
+  // NOTE: Do NOT set gateway.auth.mode here — "none" is not a valid config file value.
+  // The --auth none CLI flag on `gateway run` handles this as a runtime override.
   try {
-    await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.auth.mode", "none"]));
     await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.bind", "loopback"]));
     await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.port", String(INTERNAL_GATEWAY_PORT)]));
     await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "--json", "gateway.trustedProxies", JSON.stringify(["127.0.0.1"])]));
@@ -187,30 +188,6 @@ async function startGateway() {
     await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "--json", "gateway.controlUi.allowInsecureAuth", "true"]));
   } catch (err) {
     console.error(`[gateway] config pre-flight failed (non-fatal): ${String(err)}`);
-  }
-
-  // Belt-and-suspenders: directly patch the config file to ensure gateway.auth.mode=none.
-  // The `config set` CLI command sometimes doesn't persist when the gateway process
-  // holds its own copy of the config.
-  try {
-    const cfgFile = configPath();
-    if (fs.existsSync(cfgFile)) {
-      const raw = fs.readFileSync(cfgFile, "utf8");
-      // Try JSON parse (config is JSON5, but JSON subset works for gateway settings)
-      const cfg = JSON.parse(raw);
-      let changed = false;
-      if (!cfg.gateway) { cfg.gateway = {}; changed = true; }
-      if (!cfg.gateway.auth) { cfg.gateway.auth = {}; changed = true; }
-      if (cfg.gateway.auth.mode !== "none") { cfg.gateway.auth.mode = "none"; changed = true; }
-      if (!cfg.gateway.controlUi) { cfg.gateway.controlUi = {}; changed = true; }
-      if (cfg.gateway.controlUi.allowInsecureAuth !== true) { cfg.gateway.controlUi.allowInsecureAuth = true; changed = true; }
-      if (changed) {
-        fs.writeFileSync(cfgFile, JSON.stringify(cfg, null, 2), "utf8");
-        console.log("[gateway] Patched config file directly: gateway.auth.mode=none");
-      }
-    }
-  } catch (err) {
-    console.error(`[gateway] config file patch failed (non-fatal): ${String(err)}`);
   }
 
   // Gateway listens on loopback only — the wrapper handles all external authentication.
@@ -924,8 +901,9 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
 
   // Optional setup (only after successful onboarding).
   if (ok) {
-    // Gateway runs on loopback with no auth — the wrapper handles all external authentication.
-    await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.auth.mode", "none"]));
+    // Gateway runs on loopback — the wrapper handles all external authentication.
+    // NOTE: Do NOT set gateway.auth.mode — "none" is invalid in config schema.
+    // The --auth none CLI flag handles this at runtime.
     await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.bind", "loopback"]));
     await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.port", String(INTERNAL_GATEWAY_PORT)]));
 
@@ -1587,8 +1565,9 @@ const server = app.listen(PORT, "0.0.0.0", async () => {
       if (result.code === 0 && isConfigured()) {
         console.log("[wrapper] auto-onboarding succeeded");
 
-        // Gateway runs on loopback with no auth — the wrapper handles all external authentication.
-        await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.auth.mode", "none"]));
+        // Gateway runs on loopback — the wrapper handles all external authentication.
+        // NOTE: Do NOT set gateway.auth.mode — "none" is invalid in config schema.
+        // The --auth none CLI flag handles this at runtime.
         await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.bind", "loopback"]));
         await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.port", String(INTERNAL_GATEWAY_PORT)]));
         await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "--json", "gateway.trustedProxies", JSON.stringify(["127.0.0.1"])]));
