@@ -558,7 +558,7 @@ async function chatViaGateway(message, timeoutMs = 120000) {
           role: "operator",
           scopes: ["operator.admin", "operator.approvals", "operator.pairing"],
           device: deviceObj,
-          auth: { token: "", password: process.env.SETUP_PASSWORD || "" },
+          auth: { token: process.env.OPENCLAW_GATEWAY_TOKEN || process.env.SETUP_PASSWORD || "", password: process.env.SETUP_PASSWORD || "" },
           caps: [],
           userAgent: "XPR-Deploy-ChatRelay/1.0",
           locale: "en-US",
