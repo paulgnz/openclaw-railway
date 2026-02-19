@@ -1345,6 +1345,8 @@ app.use(async (req, res) => {
     }
   }
 
+  // Inject gateway token as Bearer auth so the gateway authenticates the proxied request.
+  req.headers["authorization"] = `Bearer ${OPENCLAW_GATEWAY_TOKEN}`;
   return proxy.web(req, res, { target: GATEWAY_TARGET });
 });
 
@@ -1365,6 +1367,53 @@ const server = app.listen(PORT, "0.0.0.0", async () => {
   console.log(`[wrapper] gateway target: ${GATEWAY_TARGET}`);
   if (!SETUP_PASSWORD) {
     console.warn("[wrapper] WARNING: SETUP_PASSWORD is not set; /setup will error.");
+  }
+
+  // Auto-onboard: if ANTHROPIC_API_KEY is set and not yet configured, run onboarding
+  // automatically. This eliminates the manual /setup wizard for automated deployments
+  // (e.g., XPR Agents deploy service).
+  if (!isConfigured() && process.env.ANTHROPIC_API_KEY?.trim()) {
+    console.log("[wrapper] ANTHROPIC_API_KEY detected, auto-onboarding...");
+    try {
+      fs.mkdirSync(STATE_DIR, { recursive: true });
+      fs.mkdirSync(WORKSPACE_DIR, { recursive: true });
+
+      const onboardArgs = buildOnboardArgs({
+        flow: "quickstart",
+        authChoice: "apiKey",
+        authSecret: process.env.ANTHROPIC_API_KEY.trim(),
+      });
+
+      const result = await runCmd(OPENCLAW_NODE, clawArgs(onboardArgs));
+      if (result.code === 0 && isConfigured()) {
+        console.log("[wrapper] auto-onboarding succeeded");
+
+        // Configure gateway token and loopback binding (same as /setup/api/run)
+        await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.auth.mode", "token"]));
+        await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.auth.token", OPENCLAW_GATEWAY_TOKEN]));
+        await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.remote.token", OPENCLAW_GATEWAY_TOKEN]));
+        await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.bind", "loopback"]));
+        await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.port", String(INTERNAL_GATEWAY_PORT)]));
+        await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "--json", "gateway.trustedProxies", JSON.stringify(["127.0.0.1"])]));
+
+        // Optional channels from env vars
+        if (process.env.TELEGRAM_BOT_TOKEN?.trim()) {
+          await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "channels.telegram.token", process.env.TELEGRAM_BOT_TOKEN.trim()]));
+          console.log("[wrapper] Telegram channel configured");
+        }
+        if (process.env.DISCORD_BOT_TOKEN?.trim()) {
+          await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "channels.discord.token", process.env.DISCORD_BOT_TOKEN.trim()]));
+          console.log("[wrapper] Discord channel configured");
+        }
+
+        // Run doctor to fix any issues
+        await runCmd(OPENCLAW_NODE, clawArgs(["doctor", "--fix"]));
+      } else {
+        console.error(`[wrapper] auto-onboarding failed (code=${result.code}):\n${result.output?.slice(0, 500)}`);
+      }
+    } catch (err) {
+      console.error(`[wrapper] auto-onboarding error: ${String(err)}`);
+    }
   }
 
   // Auto-start the gateway if already configured so polling channels (Telegram/Discord/etc.)
@@ -1391,7 +1440,11 @@ server.on("upgrade", async (req, socket, head) => {
     socket.destroy();
     return;
   }
-  proxy.ws(req, socket, head, { target: GATEWAY_TARGET });
+  // Inject gateway token into WebSocket target URL so the gateway authenticates
+  // the proxied connection. Without this, the gateway returns 1008 "token missing".
+  const sep = GATEWAY_TARGET.includes("?") ? "&" : "?";
+  const wsTarget = `${GATEWAY_TARGET}${sep}token=${encodeURIComponent(OPENCLAW_GATEWAY_TOKEN)}`;
+  proxy.ws(req, socket, head, { target: wsTarget });
 });
 
 process.on("SIGTERM", () => {
