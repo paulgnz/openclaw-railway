@@ -423,7 +423,7 @@ async function chatViaGateway(message, timeoutMs = 120000) {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "Authorization": `Bearer ${GATEWAY_TOKEN}`,
+        "Authorization": `Bearer ${OPENCLAW_GATEWAY_TOKEN}`,
         "x-openclaw-agent-id": "main",
       },
       body: JSON.stringify({
