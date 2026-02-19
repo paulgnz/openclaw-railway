@@ -1345,8 +1345,9 @@ app.use(async (req, res) => {
     }
   }
 
-  // Inject gateway token as Bearer auth so the gateway authenticates the proxied request.
-  req.headers["authorization"] = `Bearer ${OPENCLAW_GATEWAY_TOKEN}`;
+  // Inject gateway token into the request URL so the gateway authenticates the proxied request.
+  const httpSep = req.url.includes("?") ? "&" : "?";
+  req.url = `${req.url}${httpSep}token=${encodeURIComponent(OPENCLAW_GATEWAY_TOKEN)}`;
   return proxy.web(req, res, { target: GATEWAY_TARGET });
 });
 
@@ -1440,11 +1441,12 @@ server.on("upgrade", async (req, socket, head) => {
     socket.destroy();
     return;
   }
-  // Inject gateway token into WebSocket target URL so the gateway authenticates
+  // Inject gateway token into the request URL so the gateway authenticates
   // the proxied connection. Without this, the gateway returns 1008 "token missing".
-  const sep = GATEWAY_TARGET.includes("?") ? "&" : "?";
-  const wsTarget = `${GATEWAY_TARGET}${sep}token=${encodeURIComponent(OPENCLAW_GATEWAY_TOKEN)}`;
-  proxy.ws(req, socket, head, { target: wsTarget });
+  // http-proxy preserves req.url when forwarding, so we modify it directly.
+  const wsSep = req.url.includes("?") ? "&" : "?";
+  req.url = `${req.url}${wsSep}token=${encodeURIComponent(OPENCLAW_GATEWAY_TOKEN)}`;
+  proxy.ws(req, socket, head, { target: GATEWAY_TARGET });
 });
 
 process.on("SIGTERM", () => {
