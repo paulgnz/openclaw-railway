@@ -413,32 +413,42 @@ app.get("/healthz", async (_req, res) => {
 // 1. OpenClaw CLI `openclaw chat` (if available) — uses full agent personality/tools/context
 // 2. Anthropic API direct call — reliable fallback, no OpenClaw tools/context
 async function chatViaGateway(message, timeoutMs = 120000) {
-  // Approach 1: Try `openclaw agent` CLI (runs a full agent turn through the Gateway)
+  // Approach 1: Gateway's OpenAI-compatible HTTP API (/v1/chat/completions)
+  // This routes through the full gateway — agent gets tools, plugins, and conversation context.
+  // Requires gateway.http.endpoints.chatCompletions.enabled = true in config.
   try {
-    const agentArgs = ["agent", "--message", message, "--local", "--json"];
-    console.log(`[chatRelay] Using CLI: openclaw agent --message "${message.substring(0, 50)}..."`);
-    const result = await runCmd(OPENCLAW_NODE, clawArgs(agentArgs), { timeoutMs });
-    if (result.code === 0 && result.output?.trim()) {
-      // The agent command may output JSON with the response
-      let response = (result.output || "").trim();
-      try {
-        const parsed = JSON.parse(response);
-        response = parsed.response || parsed.text || parsed.content || parsed.message || response;
-      } catch {
-        // Not JSON — use raw output (may be plain text)
-      }
-      console.log(`[chatRelay] Agent CLI response length: ${response.length}`);
-      return response;
+    const gatewayUrl = `${GATEWAY_TARGET}/v1/chat/completions`;
+    console.log(`[chatRelay] Using gateway API: ${gatewayUrl}`);
+    const resp = await fetch(gatewayUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${GATEWAY_TOKEN}`,
+        "x-openclaw-agent-id": "main",
+      },
+      body: JSON.stringify({
+        model: "openclaw",
+        messages: [{ role: "user", content: message }],
+      }),
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+
+    if (resp.ok) {
+      const data = await resp.json();
+      const response = data.choices?.[0]?.message?.content || "";
+      console.log(`[chatRelay] Gateway API response length: ${response.length}`);
+      if (response) return response;
     }
-    console.warn(`[chatRelay] Agent CLI failed (code=${result.code}): ${(result.output || "").substring(0, 300)}`);
+    const errText = await resp.text().catch(() => "");
+    console.warn(`[chatRelay] Gateway API failed (${resp.status}): ${errText.substring(0, 300)}`);
   } catch (err) {
-    console.warn(`[chatRelay] Agent CLI approach failed: ${String(err)}`);
+    console.warn(`[chatRelay] Gateway API approach failed: ${String(err)}`);
   }
 
-  // Approach 2: Anthropic API direct call
+  // Approach 2: Anthropic API direct call (fallback if gateway is down)
   const apiKey = process.env.ANTHROPIC_API_KEY?.trim();
   if (!apiKey) {
-    throw new Error("Chat not available: openclaw chat CLI not found and no ANTHROPIC_API_KEY configured");
+    throw new Error("Chat not available: gateway API failed and no ANTHROPIC_API_KEY configured");
   }
 
   console.log(`[chatRelay] Using Anthropic API fallback`);
@@ -478,7 +488,7 @@ async function chatViaGateway(message, timeoutMs = 120000) {
 
   const data = await resp.json();
   const response = data.content?.map(b => b.text).join("") || "";
-  console.log(`[chatRelay] API response length: ${response.length}`);
+  console.log(`[chatRelay] Anthropic API response length: ${response.length}`);
   return response;
 }
 
@@ -921,6 +931,10 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
 
     // Enable gateway restart command so plugins/skills can restart the gateway after install
     await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "--json", "commands.restart", "true"]));
+
+    // Enable the OpenAI-compatible HTTP API so the deploy dashboard can chat through the gateway
+    // (agent gets full access to tools, plugins, and conversation context)
+    await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "--json", "gateway.http.endpoints.chatCompletions.enabled", "true"]));
 
     // Optional: configure a custom OpenAI-compatible provider (base URL) for advanced users.
     if (payload.customProviderId?.trim() && payload.customProviderBaseUrl?.trim()) {
@@ -1582,6 +1596,9 @@ const server = app.listen(PORT, "0.0.0.0", async () => {
 
         // Enable gateway restart command so plugins/skills can restart the gateway after install
         await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "--json", "commands.restart", "true"]));
+
+        // Enable the OpenAI-compatible HTTP API so the deploy dashboard can chat through the gateway
+        await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "--json", "gateway.http.endpoints.chatCompletions.enabled", "true"]));
 
         // Optional channels from env vars
         if (process.env.TELEGRAM_BOT_TOKEN?.trim()) {
