@@ -411,9 +411,16 @@ app.get("/healthz", async (_req, res) => {
 // This ensures the chat goes through OpenClaw with the agent's full personality, tools, and context.
 async function chatViaGateway(message, timeoutMs = 120000) {
   return new Promise((resolve, reject) => {
-    // Use "localhost" (not 127.0.0.1) so the gateway treats this as a secure context.
+    // Connect to internal gateway. The gateway checks for secure context (HTTPS or localhost).
+    // Set X-Forwarded-Proto: https since gateway trusts 127.0.0.1 as a trusted proxy.
     const wsUrl = `ws://localhost:${INTERNAL_GATEWAY_PORT}/`;
-    const ws = new WebSocket(wsUrl, { headers: { Origin: `http://localhost:${INTERNAL_GATEWAY_PORT}` } });
+    const ws = new WebSocket(wsUrl, {
+      headers: {
+        "Origin": `https://localhost:${INTERNAL_GATEWAY_PORT}`,
+        "X-Forwarded-Proto": "https",
+        "Host": "localhost",
+      },
+    });
     let sessionKey = null;
     let responseText = "";
     let chatSent = false;
