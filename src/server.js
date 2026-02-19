@@ -437,29 +437,29 @@ async function chatViaGateway(message, timeoutMs = 120000) {
       setTimeout(() => sendConnect(), 100);
     });
 
-    function sendConnect(nonce) {
-      const params = {
-        minProtocol: 3,
-        maxProtocol: 3,
-        client: {
-          id: "openclaw-control-ui",
-          version: "1.0.0",
-          platform: "linux",
-          mode: "webchat",
+    function sendConnect() {
+      // Gateway runs with --auth none on loopback, so no device/token auth needed.
+      // We omit the device object entirely (it would require ECDSA signing).
+      ws.send(JSON.stringify({
+        type: "req",
+        id: crypto.randomUUID(),
+        method: "connect",
+        params: {
+          minProtocol: 3,
+          maxProtocol: 3,
+          client: {
+            id: "openclaw-control-ui",
+            version: "1.0.0",
+            platform: "linux",
+            mode: "webchat",
+          },
+          role: "operator",
+          scopes: ["operator.admin", "operator.approvals", "operator.pairing"],
+          caps: [],
+          userAgent: "XPR-Deploy-Dashboard/1.0",
+          locale: "en-US",
         },
-        role: "operator",
-        scopes: ["operator.admin", "operator.approvals", "operator.pairing"],
-        caps: [],
-        userAgent: "XPR-Deploy-Dashboard/1.0",
-        locale: "en-US",
-      };
-
-      // If gateway sends a challenge nonce, include it in the device object
-      if (nonce) {
-        params.device = { nonce };
-      }
-
-      ws.send(JSON.stringify({ type: "req", id: crypto.randomUUID(), method: "connect", params }));
+      }));
     }
 
     function sendChat() {
@@ -493,9 +493,9 @@ async function chatViaGateway(message, timeoutMs = 120000) {
         const msg = JSON.parse(raw.toString());
 
         if (msg.type === "event") {
-          // Challenge-response (unlikely with --auth none, but defensive)
-          if (msg.event === "connect.challenge" && msg.payload?.nonce) {
-            sendConnect(msg.payload.nonce);
+          // Challenge-response: with --auth none, just re-send connect without device auth.
+          if (msg.event === "connect.challenge") {
+            sendConnect();
             return;
           }
           // Chat streaming events
