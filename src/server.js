@@ -498,6 +498,143 @@ async function chatViaGateway(message, timeoutMs = 120000) {
   return response;
 }
 
+// --- Job Board Poller ---
+// Polls the XPR Agents indexer for open jobs and notifies the agent about new ones.
+// The agent can then decide to bid using its built-in escrow tools (xpr_submit_bid).
+
+const JOB_POLL_INTERVAL = 30_000; // 30 seconds
+const SEEN_JOBS_FILE = path.join(STATE_DIR, "seen-jobs.json");
+let seenJobIds = new Set();
+let jobPollerTimer = null;
+
+function loadSeenJobs() {
+  try {
+    const data = JSON.parse(fs.readFileSync(SEEN_JOBS_FILE, "utf8"));
+    seenJobIds = new Set(Array.isArray(data) ? data : []);
+    console.log(`[jobPoller] Loaded ${seenJobIds.size} seen job IDs`);
+  } catch {
+    seenJobIds = new Set();
+  }
+}
+
+function saveSeenJobs() {
+  try {
+    fs.mkdirSync(path.dirname(SEEN_JOBS_FILE), { recursive: true });
+    fs.writeFileSync(SEEN_JOBS_FILE, JSON.stringify([...seenJobIds]), "utf8");
+  } catch (err) {
+    console.warn(`[jobPoller] Failed to save seen jobs: ${String(err)}`);
+  }
+}
+
+async function pollJobBoard() {
+  const indexerUrl = process.env.XPR_INDEXER_URL?.trim();
+  if (!indexerUrl) return;
+
+  const agentAccount = process.env.XPR_ACCOUNT?.trim();
+  if (!agentAccount) return;
+
+  try {
+    const resp = await fetch(`${indexerUrl}/jobs/open?limit=50`, {
+      signal: AbortSignal.timeout(10_000),
+    });
+
+    if (!resp.ok) {
+      console.warn(`[jobPoller] Indexer returned ${resp.status}`);
+      return;
+    }
+
+    const data = await resp.json();
+    const jobs = data.jobs || [];
+
+    // Filter to funded jobs only (state=1) — unfunded jobs can't be worked on
+    const fundedJobs = jobs.filter((j) => j.state === 1);
+
+    const newJobs = fundedJobs.filter((j) => !seenJobIds.has(j.id));
+
+    if (newJobs.length === 0) return;
+
+    // Mark all as seen immediately to avoid duplicate notifications
+    for (const job of newJobs) {
+      seenJobIds.add(job.id);
+    }
+    saveSeenJobs();
+
+    console.log(`[jobPoller] Found ${newJobs.length} new funded job(s)`);
+
+    // Build notification message for the agent
+    const jobList = newJobs.map((j) => {
+      const amount = j.amount ? (j.amount / 10000).toFixed(4) : "0";
+      const deadline = j.deadline
+        ? new Date(j.deadline * 1000).toISOString().split("T")[0]
+        : "none";
+      return [
+        `- **Job #${j.id}**: ${j.title || "(untitled)"}`,
+        `  Client: ${j.client} | Budget: ${amount} ${j.symbol || "XPR"} | Deadline: ${deadline}`,
+        j.description ? `  ${j.description.substring(0, 200)}` : "",
+      ].filter(Boolean).join("\n");
+    }).join("\n\n");
+
+    const message = [
+      `New open job${newJobs.length > 1 ? "s" : ""} posted on the XPR Agents job board:`,
+      "",
+      jobList,
+      "",
+      `You can use your xpr_list_open_jobs and xpr_submit_bid tools to review and bid on jobs that match your capabilities.`,
+      `Your account is: ${agentAccount}`,
+    ].join("\n");
+
+    // Send to agent via gateway with a dedicated session key for job notifications
+    try {
+      await ensureGatewayRunning();
+
+      const gatewayUrl = `${GATEWAY_TARGET}/v1/chat/completions`;
+      const resp = await fetch(gatewayUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${OPENCLAW_GATEWAY_TOKEN}`,
+          "x-openclaw-agent-id": "main",
+          "x-openclaw-session-key": "agent:main:jobs",
+        },
+        body: JSON.stringify({
+          model: "openclaw",
+          messages: [{ role: "user", content: message }],
+        }),
+        signal: AbortSignal.timeout(120_000),
+      });
+
+      if (resp.ok) {
+        const result = await resp.json();
+        const reply = result.choices?.[0]?.message?.content || "";
+        console.log(`[jobPoller] Agent response (${reply.length} chars): ${reply.substring(0, 200)}`);
+      } else {
+        console.warn(`[jobPoller] Gateway returned ${resp.status}`);
+      }
+    } catch (err) {
+      console.warn(`[jobPoller] Failed to notify agent: ${String(err)}`);
+    }
+  } catch (err) {
+    console.warn(`[jobPoller] Poll failed: ${String(err)}`);
+  }
+}
+
+function startJobPoller() {
+  const indexerUrl = process.env.XPR_INDEXER_URL?.trim();
+  if (!indexerUrl) {
+    console.log("[jobPoller] XPR_INDEXER_URL not set — job polling disabled");
+    return;
+  }
+
+  loadSeenJobs();
+  console.log(`[jobPoller] Starting — polling ${indexerUrl}/jobs/open every ${JOB_POLL_INTERVAL / 1000}s`);
+
+  // Initial poll after a short delay (let gateway stabilize)
+  setTimeout(() => {
+    pollJobBoard();
+    jobPollerTimer = setInterval(pollJobBoard, JOB_POLL_INTERVAL);
+  }, 10_000);
+}
+
 // --- Gateway session history via WebSocket RPC ---
 // Opens a per-request WebSocket to the gateway, authenticates, fetches chat history, then closes.
 async function getGatewayHistory(sessionKey = "agent:main:main", limit = 50) {
@@ -1739,6 +1876,9 @@ const server = app.listen(PORT, "0.0.0.0", async () => {
     try {
       await ensureGatewayRunning();
       console.log("[wrapper] gateway ready");
+
+      // Start job board poller after gateway is ready
+      startJobPoller();
     } catch (err) {
       console.error(`[wrapper] gateway failed to start at boot: ${String(err)}`);
     }
