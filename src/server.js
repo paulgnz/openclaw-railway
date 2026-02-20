@@ -501,11 +501,16 @@ async function chatViaGateway(message, timeoutMs = 120000) {
 // --- Job Board Poller ---
 // Polls the XPR Agents indexer for open jobs and notifies the agent about new ones.
 // The agent can then decide to bid using its built-in escrow tools (xpr_submit_bid).
+// CREDIT PROTECTION: Minimum job value and daily eval cap prevent runaway API usage.
 
 const JOB_POLL_INTERVAL = 30_000; // 30 seconds
 const SEEN_JOBS_FILE = path.join(STATE_DIR, "seen-jobs.json");
+const JOB_POLLER_MIN_XPR = parseFloat(process.env.JOB_POLLER_MIN_XPR || "100");
+const JOB_POLLER_MAX_EVALS_PER_DAY = parseInt(process.env.JOB_POLLER_MAX_EVALS_PER_DAY || "20", 10);
 let seenJobIds = new Set();
 let jobPollerTimer = null;
+let dailyEvalCount = 0;
+let dailyEvalResetDate = new Date().toISOString().slice(0, 10);
 
 function loadSeenJobs() {
   try {
@@ -559,10 +564,41 @@ async function pollJobBoard() {
     }
     saveSeenJobs();
 
-    console.log(`[jobPoller] Found ${newJobs.length} new funded job(s)`);
+    // Reset daily counter on new day
+    const today = new Date().toISOString().slice(0, 10);
+    if (today !== dailyEvalResetDate) {
+      dailyEvalCount = 0;
+      dailyEvalResetDate = today;
+      console.log(`[jobPoller] Daily eval counter reset (new day: ${today})`);
+    }
+
+    // Credit protection: daily eval cap
+    if (dailyEvalCount >= JOB_POLLER_MAX_EVALS_PER_DAY) {
+      console.log(`[jobPoller] Daily eval cap reached (${dailyEvalCount}/${JOB_POLLER_MAX_EVALS_PER_DAY}), skipping ${newJobs.length} job(s)`);
+      return;
+    }
+
+    // Credit protection: filter out low-value jobs
+    const worthyJobs = newJobs.filter((j) => {
+      const xpr = j.amount ? j.amount / 10000 : 0;
+      if (xpr < JOB_POLLER_MIN_XPR) {
+        console.log(`[jobPoller] Skipping low-value job #${j.id}: ${xpr} XPR < ${JOB_POLLER_MIN_XPR} XPR minimum`);
+        return false;
+      }
+      return true;
+    });
+
+    if (worthyJobs.length === 0) return;
+
+    // Cap to remaining daily budget
+    const remaining = JOB_POLLER_MAX_EVALS_PER_DAY - dailyEvalCount;
+    const jobsToProcess = worthyJobs.slice(0, remaining);
+    dailyEvalCount += jobsToProcess.length;
+
+    console.log(`[jobPoller] Found ${jobsToProcess.length} new funded job(s) (eval ${dailyEvalCount}/${JOB_POLLER_MAX_EVALS_PER_DAY} today)`);
 
     // Build notification message for the agent
-    const jobList = newJobs.map((j) => {
+    const jobList = jobsToProcess.map((j) => {
       const amount = j.amount ? (j.amount / 10000).toFixed(4) : "0";
       const deadline = j.deadline
         ? new Date(j.deadline * 1000).toISOString().split("T")[0]
@@ -575,7 +611,7 @@ async function pollJobBoard() {
     }).join("\n\n");
 
     const message = [
-      `New open job${newJobs.length > 1 ? "s" : ""} posted on the XPR Agents job board:`,
+      `New open job${jobsToProcess.length > 1 ? "s" : ""} posted on the XPR Agents job board:`,
       "",
       jobList,
       "",
@@ -626,7 +662,7 @@ function startJobPoller() {
   }
 
   loadSeenJobs();
-  console.log(`[jobPoller] Starting — polling ${indexerUrl}/jobs/open every ${JOB_POLL_INTERVAL / 1000}s`);
+  console.log(`[jobPoller] Starting — polling ${indexerUrl}/jobs/open every ${JOB_POLL_INTERVAL / 1000}s (min: ${JOB_POLLER_MIN_XPR} XPR, max: ${JOB_POLLER_MAX_EVALS_PER_DAY}/day)`);
 
   // Initial poll after a short delay (let gateway stabilize)
   setTimeout(() => {
