@@ -1168,9 +1168,9 @@ function runCmd(cmd, args, opts = {}) {
 app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
   try {
     const safeWrite = (msg) => {
-      try {
-        if (!res.writableEnded) res.write(String(msg) + "\n");
-      } catch {}
+      // Log instead of writing to response stream to avoid ERR_HTTP_HEADERS_SENT
+      // when res.json() is called later.
+      console.log(`[setup] ${msg}`);
     };
     if (isConfigured()) {
       await ensureGatewayRunning();
@@ -1865,7 +1865,9 @@ const server = app.listen(PORT, "0.0.0.0", async () => {
         authSecret: process.env.ANTHROPIC_API_KEY.trim(),
       });
 
+      console.log(`[wrapper] onboard args: ${JSON.stringify(onboardArgs.filter(a => !a.startsWith("sk-")))}`);
       const result = await runCmd(OPENCLAW_NODE, clawArgs(onboardArgs));
+      console.log(`[wrapper] onboard exit=${result.code}, output (${result.output?.length || 0} chars):\n${(result.output || "(empty)").slice(0, 2000)}`);
       if (result.code === 0 && isConfigured()) {
         console.log("[wrapper] auto-onboarding succeeded");
 
