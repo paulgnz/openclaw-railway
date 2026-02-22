@@ -2192,6 +2192,15 @@ const server = app.listen(PORT, "0.0.0.0", async () => {
     try {
       let configChanged = false;
 
+      // Model override from env (e.g. AGENT_MODEL=anthropic/claude-sonnet-4-20250514)
+      const agentModel = process.env.AGENT_MODEL?.trim();
+      if (agentModel) {
+        // Set the default model for the Anthropic provider
+        await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "models.default", agentModel]));
+        console.log(`[wrapper] model override: ${agentModel}`);
+        configChanged = true;
+      }
+
       // Telegram channel from env (re-apply on every restart in case token was updated)
       if (process.env.TELEGRAM_BOT_TOKEN?.trim()) {
         const tgCfg = {
