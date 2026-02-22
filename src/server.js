@@ -270,12 +270,16 @@ async function startGateway() {
     await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "--json", "gateway.controlUi.allowedOrigins", JSON.stringify(["*"])]));
     // Allow insecure (non-TLS) connections — the wrapper handles TLS termination externally.
     await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "--json", "gateway.controlUi.allowInsecureAuth", "true"]));
+    // Sync gateway auth token on every start
+    if (OPENCLAW_GATEWAY_TOKEN) {
+      await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.auth.token", OPENCLAW_GATEWAY_TOKEN]));
+      await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.remote.token", OPENCLAW_GATEWAY_TOKEN]));
+    }
   } catch (err) {
     console.error(`[gateway] config pre-flight failed (non-fatal): ${String(err)}`);
   }
 
   // Gateway listens on loopback only — the wrapper handles all external authentication.
-  // Using --auth none eliminates the challenge-response requirement that causes 1008 disconnects.
   const args = [
     "gateway",
     "run",
@@ -1956,14 +1960,18 @@ const server = app.listen(PORT, "0.0.0.0", async () => {
         console.log("[wrapper] auto-onboarding succeeded");
 
         // Gateway runs on loopback — the wrapper handles all external authentication.
-        // NOTE: Do NOT set gateway.auth.mode — "none" is invalid in config schema.
-        // The --auth none CLI flag handles this at runtime.
         await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.bind", "loopback"]));
         await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.port", String(INTERNAL_GATEWAY_PORT)]));
         await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "--json", "gateway.trustedProxies", JSON.stringify(["127.0.0.1"])]));
         // Allow internal WebSocket connections (chat relay) and all external origins (proxied through wrapper auth)
         await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "--json", "gateway.controlUi.allowedOrigins", JSON.stringify(["*"])]));
         await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "--json", "gateway.controlUi.allowInsecureAuth", "true"]));
+        // Sync gateway auth token to match the wrapper's token (onboard generates its own).
+        // This ensures the chat relay and proxy can authenticate with the gateway.
+        if (OPENCLAW_GATEWAY_TOKEN) {
+          await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.auth.token", OPENCLAW_GATEWAY_TOKEN]));
+          await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.remote.token", OPENCLAW_GATEWAY_TOKEN]));
+        }
 
         // Enable gateway restart command so plugins/skills can restart the gateway after install
         await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "--json", "commands.restart", "true"]));
