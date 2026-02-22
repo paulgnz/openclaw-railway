@@ -627,7 +627,8 @@ async function pollJobBoard() {
   if (!agentAccount) return;
 
   try {
-    const resp = await fetch(`${indexerUrl}/jobs/open?limit=50`, {
+    // Fetch funded jobs (state=1) that have no agent assigned yet
+    const resp = await fetch(`${indexerUrl}/jobs?state=1&limit=50`, {
       signal: AbortSignal.timeout(10_000),
     });
 
@@ -637,10 +638,10 @@ async function pollJobBoard() {
     }
 
     const data = await resp.json();
-    const jobs = data.jobs || [];
+    const allJobs = data.jobs || [];
 
-    // Filter to funded jobs only (state=1) — unfunded jobs can't be worked on
-    const fundedJobs = jobs.filter((j) => j.state === 1);
+    // Filter to open jobs only (no agent assigned)
+    const fundedJobs = allJobs.filter((j) => !j.agent || j.agent === "");
 
     const newJobs = fundedJobs.filter((j) => !seenJobIds.has(j.id));
 
