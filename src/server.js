@@ -8,7 +8,7 @@ import express from "express";
 import httpProxy from "http-proxy";
 import * as tar from "tar";
 
-const WRAPPER_VERSION = "1.2.0"; // XPR plugin auto-install
+const WRAPPER_VERSION = "1.3.0"; // Social scheduler fix + manual trigger
 
 // Migrate deprecated CLAWDBOT_* env vars → OPENCLAW_* so existing Railway deployments
 // keep working. Users should update their Railway Variables to use the new names.
@@ -818,25 +818,34 @@ function saveLastSocialPostDate(dateStr) {
   }
 }
 
-async function doSocialPost() {
+async function doSocialPost(force = false) {
   const agentMode = (process.env.AGENT_MODE || "worker").toLowerCase();
-  if (agentMode !== "social") return;
+  if (agentMode !== "social") {
+    console.log(`[socialScheduler] Skipping — mode is "${agentMode}" (not social)`);
+    return { skipped: true, reason: "not social mode" };
+  }
 
   const agentAccount = process.env.XPR_ACCOUNT?.trim();
-  if (!agentAccount) return;
+  if (!agentAccount) {
+    console.log(`[socialScheduler] Skipping — XPR_ACCOUNT not set`);
+    return { skipped: true, reason: "no XPR_ACCOUNT" };
+  }
 
   const today = new Date().toISOString().slice(0, 10);
   const lastPost = getLastSocialPostDate();
 
-  if (lastPost === today) return; // Already posted today
+  if (lastPost === today && !force) {
+    console.log(`[socialScheduler] Skipping — already posted today (${today})`);
+    return { skipped: true, reason: `already posted ${today}` };
+  }
 
-  console.log(`[socialScheduler] Daily post due (last: ${lastPost || "never"}, today: ${today})`);
+  console.log(`[socialScheduler] Daily post due (last: ${lastPost || "never"}, today: ${today}${force ? ", forced" : ""})`);
 
   const message = [
     `Time for your daily Shellbook activity! Today is ${today}.`,
     "",
     "1. First, check what's happening on Shellbook — use shell_list_posts to see recent posts from other agents and users.",
-    "2. Engage with 1-2 interesting posts (shell_vote or shell_create_comment).",
+    "2. Engage with 1-2 interesting posts (upvote or comment).",
     "3. Create one original post using shell_create_post. Share something interesting — it could be about XPR Network, DeFi, NFTs, AI agents, crypto, or anything your community would enjoy. Be authentic and conversational.",
     "",
     `Your account is: ${agentAccount}`,
@@ -845,39 +854,23 @@ async function doSocialPost() {
   try {
     await ensureGatewayRunning();
 
-    const gatewayUrl = `${GATEWAY_TARGET}/v1/chat/completions`;
-    const resp = await fetch(gatewayUrl, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${OPENCLAW_GATEWAY_TOKEN}`,
-        "x-openclaw-agent-id": "main",
-        "x-openclaw-session-key": "agent:main:social",
-      },
-      body: JSON.stringify({
-        model: "openclaw",
-        messages: [{ role: "user", content: message }],
-      }),
-      signal: AbortSignal.timeout(120_000),
-    });
+    // Use chatViaGateway for consistency with dashboard chat (includes Anthropic fallback)
+    const reply = await chatViaGateway(message, 180_000);
+    console.log(`[socialScheduler] Agent response (${reply.length} chars): ${reply.substring(0, 300)}`);
 
-    if (resp.ok) {
-      const result = await resp.json();
-      const reply = result.choices?.[0]?.message?.content || "";
-      console.log(`[socialScheduler] Agent response (${reply.length} chars): ${reply.substring(0, 300)}`);
-      // Only save the date if the agent actually succeeded (didn't say it lacks tools)
-      const failed = /don't have|no.*tool|not available|cannot|can't/i.test(reply);
-      if (!failed) {
-        saveLastSocialPostDate(today);
-        console.log(`[socialScheduler] Daily post completed for ${today}`);
-      } else {
-        console.warn(`[socialScheduler] Agent could not post (tools missing?) — will retry next check`);
-      }
+    // Only save the date if the agent actually succeeded (didn't say it lacks tools)
+    const failed = /don't have|no.*tool|not available|cannot|can't/i.test(reply);
+    if (!failed) {
+      saveLastSocialPostDate(today);
+      console.log(`[socialScheduler] Daily post completed for ${today}`);
+      return { ok: true, date: today, reply: reply.substring(0, 300) };
     } else {
-      console.warn(`[socialScheduler] Gateway returned ${resp.status}`);
+      console.warn(`[socialScheduler] Agent could not post (tools missing?) — will retry next check`);
+      return { ok: false, reason: "tools missing", reply: reply.substring(0, 300) };
     }
   } catch (err) {
     console.warn(`[socialScheduler] Failed: ${String(err)}`);
+    return { ok: false, reason: String(err) };
   }
 }
 
@@ -887,11 +880,11 @@ function startSocialScheduler() {
 
   console.log(`[socialScheduler] Starting — checking every ${SOCIAL_CHECK_INTERVAL / 1000 / 60}min for daily post`);
 
-  // Initial check after 30s (let gateway stabilize)
+  // Initial check after 60s (let gateway fully stabilize + plugin load)
   setTimeout(() => {
     doSocialPost();
     socialTimer = setInterval(doSocialPost, SOCIAL_CHECK_INTERVAL);
-  }, 30_000);
+  }, 60_000);
 }
 
 // --- Gateway session history via WebSocket RPC ---
@@ -1044,6 +1037,33 @@ app.get("/setup/app.js", requireSetupAuth, (_req, res) => {
   // Serve JS for /setup (kept external to avoid inline encoding/template issues)
   res.type("application/javascript");
   res.send(fs.readFileSync(path.join(process.cwd(), "src", "setup-app.js"), "utf8"));
+});
+
+// Manual social post trigger (same auth as hooks/agent)
+app.post("/hooks/social-post", async (req, res) => {
+  const hookToken = process.env.OPENCLAW_HOOK_TOKEN?.trim();
+  if (!hookToken) return res.status(500).json({ error: "OPENCLAW_HOOK_TOKEN not configured" });
+  const authHeader = req.headers.authorization || "";
+  if (!authHeader.startsWith("Bearer ") || authHeader.slice(7) !== hookToken) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+  const force = req.body?.force === true;
+  try {
+    const result = await doSocialPost(force);
+    return res.json(result);
+  } catch (err) {
+    return res.status(500).json({ error: String(err) });
+  }
+});
+
+// Social scheduler state (no auth — informational only)
+app.get("/hooks/social-status", async (_req, res) => {
+  res.json({
+    mode: (process.env.AGENT_MODE || "worker").toLowerCase(),
+    lastPost: getLastSocialPostDate() || null,
+    today: new Date().toISOString().slice(0, 10),
+    schedulerActive: socialTimer !== null,
+  });
 });
 
 app.get("/setup", requireSetupAuth, (_req, res) => {

@@ -65,7 +65,7 @@ RUN printf '%s\n' '#!/usr/bin/env bash' 'exec node /openclaw/dist/entry.js "$@"'
   && chmod +x /usr/local/bin/openclaw
 
 # Cache-bust: increment to force src re-copy
-ARG SRC_VERSION=2
+ARG SRC_VERSION=3
 COPY src ./src
 
 # The wrapper listens on $PORT.
