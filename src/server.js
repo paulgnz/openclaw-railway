@@ -124,6 +124,32 @@ Use the xpr_agents plugin tools for all blockchain operations. Key tools:
 }
 
 
+/**
+ * Install and enable the @xpr-agents/openclaw plugin.
+ * This gives the gateway access to XPR blockchain tools (jobs, bids, feedback, etc.)
+ * and suppresses OpenClaw's default bootstrap flow by setting a personality prompt.
+ */
+async function installXprPlugin(agentAccount, agentMode) {
+  // Install the XPR agents plugin (provides 55+ blockchain tools)
+  console.log("[wrapper] Installing @xpr-agents/openclaw plugin...");
+  const install = await runCmd(OPENCLAW_NODE, clawArgs(["plugins", "install", "@xpr-agents/openclaw"]), { timeoutMs: 180_000 });
+  if (install.code === 0) {
+    console.log("[wrapper] @xpr-agents/openclaw plugin installed");
+    const enable = await runCmd(OPENCLAW_NODE, clawArgs(["plugins", "enable", "@xpr-agents/openclaw"]));
+    console.log(`[wrapper] plugin enable exit=${enable.code}`);
+  } else {
+    console.warn(`[wrapper] plugin install failed (code=${install.code}): ${install.output?.slice(0, 300)}`);
+  }
+
+  // Set personality prompt to give the agent its XPR identity.
+  // This overrides OpenClaw's default bootstrap behavior that asks "who am I?"
+  const account = agentAccount || process.env.XPR_ACCOUNT || "unknown";
+  const mode = agentMode || (process.env.AGENT_MODE || "worker").toLowerCase();
+  const identity = `You are ${account}, an autonomous AI agent on XPR Network. You operate in ${mode} mode. Use your XPR blockchain tools for all on-chain operations.`;
+  await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "personality.prompt", identity]));
+  console.log(`[wrapper] personality.prompt set (${mode} mode)`);
+}
+
 // Gateway admin token (protects OpenClaw gateway + Control UI).
 // Must be stable across restarts. If not provided via env, persist it in the state dir.
 function resolveGatewayToken() {
@@ -1427,6 +1453,10 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
     const fix = await runCmd(OPENCLAW_NODE, clawArgs(["doctor", "--fix"]));
     extra += `\n[doctor --fix] exit=${fix.code} (output ${fix.output.length} chars)\n${fix.output || "(no output)"}`;
 
+    // Install XPR agents plugin and set personality prompt
+    const pluginResult = await installXprPlugin();
+    extra += `\n[xpr plugin] installed`;
+
     // Doctor may require a restart depending on changes.
     await restartGateway();
   }
@@ -2006,6 +2036,9 @@ const server = app.listen(PORT, "0.0.0.0", async () => {
 
         // Run doctor --fix to apply any "configured but not enabled" changes
         await runCmd(OPENCLAW_NODE, clawArgs(["doctor", "--fix"]));
+
+        // Install XPR agents plugin and set personality prompt
+        await installXprPlugin();
       } else {
         console.error(`[wrapper] auto-onboarding failed (code=${result.code}):\n${result.output?.slice(0, 500)}`);
       }
@@ -2019,14 +2052,31 @@ const server = app.listen(PORT, "0.0.0.0", async () => {
   if (isConfigured()) {
     // Write CLAUDE.md to workspace so the gateway has agent identity and instructions.
     // Updated on every restart to reflect current AGENT_MODE.
+    // Also remove BOOTSTRAP.md if present — it causes OpenClaw's default "who am I?" flow
+    // which conflicts with the XPR agent identity.
     try {
       const agentMode = (process.env.AGENT_MODE || "worker").toLowerCase();
       const agentAccount = process.env.XPR_ACCOUNT || "unknown";
       const claudeMd = generateClaudeMd(agentAccount, agentMode);
       fs.writeFileSync(path.join(WORKSPACE_DIR, "CLAUDE.md"), claudeMd);
       console.log(`[wrapper] CLAUDE.md written (mode=${agentMode}, account=${agentAccount})`);
+
+      // Remove bootstrap file if present — prevents OpenClaw's default onboarding dialog
+      const bootstrapPath = path.join(WORKSPACE_DIR, "BOOTSTRAP.md");
+      if (fs.existsSync(bootstrapPath)) {
+        fs.unlinkSync(bootstrapPath);
+        console.log("[wrapper] Removed BOOTSTRAP.md (suppressed default onboarding)");
+      }
     } catch (err) {
       console.error(`[wrapper] failed to write CLAUDE.md (non-fatal): ${String(err)}`);
+    }
+
+    // Ensure XPR plugin is installed and personality prompt is set on every restart.
+    // Handles existing deployments that were created before the plugin auto-install was added.
+    try {
+      await installXprPlugin();
+    } catch (err) {
+      console.error(`[wrapper] XPR plugin install on restart failed (non-fatal): ${String(err)}`);
     }
 
     // Apply env var overrides to existing config on every restart.
