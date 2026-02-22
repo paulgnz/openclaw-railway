@@ -64,6 +64,8 @@ COPY --from=openclaw-build /openclaw /openclaw
 RUN printf '%s\n' '#!/usr/bin/env bash' 'exec node /openclaw/dist/entry.js "$@"' > /usr/local/bin/openclaw \
   && chmod +x /usr/local/bin/openclaw
 
+# Cache-bust: increment to force src re-copy
+ARG SRC_VERSION=2
 COPY src ./src
 
 # The wrapper listens on $PORT.

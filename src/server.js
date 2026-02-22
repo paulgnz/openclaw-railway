@@ -8,6 +8,8 @@ import express from "express";
 import httpProxy from "http-proxy";
 import * as tar from "tar";
 
+const WRAPPER_VERSION = "1.2.0"; // XPR plugin auto-install
+
 // Migrate deprecated CLAWDBOT_* env vars → OPENCLAW_* so existing Railway deployments
 // keep working. Users should update their Railway Variables to use the new names.
 for (const suffix of ["PUBLIC_PORT", "STATE_DIR", "WORKSPACE_DIR", "GATEWAY_TOKEN", "CONFIG_PATH"]) {
@@ -1951,7 +1953,7 @@ app.use(async (req, res) => {
 });
 
 const server = app.listen(PORT, "0.0.0.0", async () => {
-  console.log(`[wrapper] listening on :${PORT}`);
+  console.log(`[wrapper] v${WRAPPER_VERSION} listening on :${PORT}`);
   console.log(`[wrapper] state dir: ${STATE_DIR}`);
   console.log(`[wrapper] workspace dir: ${WORKSPACE_DIR}`);
 
