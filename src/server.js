@@ -135,10 +135,11 @@ async function installXprPlugin(agentAccount, agentMode) {
   // Install/update the XPR agents plugin (provides 70+ blockchain + social tools)
   console.log("[wrapper] Installing @xpr-agents/openclaw plugin (latest)...");
 
-  // Uninstall first to ensure we get the latest version (openclaw caches installed plugins)
-  await runCmd(OPENCLAW_NODE, clawArgs(["plugins", "uninstall", "@xpr-agents/openclaw"]), { timeoutMs: 30_000 });
+  // Uninstall first to ensure we get the latest version (openclaw caches installed plugins).
+  // Use plugin ID "openclaw" (not npm package name) for uninstall.
+  await runCmd(OPENCLAW_NODE, clawArgs(["plugins", "uninstall", "openclaw"]), { timeoutMs: 30_000 });
 
-  const install = await runCmd(OPENCLAW_NODE, clawArgs(["plugins", "install", "@xpr-agents/openclaw"]), { timeoutMs: 180_000 });
+  const install = await runCmd(OPENCLAW_NODE, clawArgs(["plugins", "install", "@xpr-agents/openclaw@latest"]), { timeoutMs: 180_000 });
   if (install.code === 0) {
     console.log("[wrapper] @xpr-agents/openclaw plugin installed");
     const enable = await runCmd(OPENCLAW_NODE, clawArgs(["plugins", "enable", "@xpr-agents/openclaw"]));
@@ -2191,15 +2192,6 @@ const server = app.listen(PORT, "0.0.0.0", async () => {
     // without requiring a full re-onboard.
     try {
       let configChanged = false;
-
-      // Model override from env (e.g. AGENT_MODEL=anthropic/claude-sonnet-4-20250514)
-      const agentModel = process.env.AGENT_MODEL?.trim();
-      if (agentModel) {
-        // Set the default model for the Anthropic provider
-        await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "models.default", agentModel]));
-        console.log(`[wrapper] model override: ${agentModel}`);
-        configChanged = true;
-      }
 
       // Telegram channel from env (re-apply on every restart in case token was updated)
       if (process.env.TELEGRAM_BOT_TOKEN?.trim()) {
