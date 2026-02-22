@@ -1069,13 +1069,13 @@ function buildOnboardArgs(payload) {
     "--skip-health",
     "--workspace",
     WORKSPACE_DIR,
-    // The wrapper owns public networking and authentication; keep the gateway internal with no auth.
+    // The wrapper owns public networking and authentication; gateway runs on loopback with token auth.
     "--gateway-bind",
     "loopback",
     "--gateway-port",
     String(INTERNAL_GATEWAY_PORT),
     "--gateway-auth",
-    "none",
+    "token",
     "--flow",
     payload.flow || "quickstart",
   ];
