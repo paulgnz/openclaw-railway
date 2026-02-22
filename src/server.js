@@ -751,7 +751,7 @@ function startJobPoller() {
   }
 
   loadSeenJobs();
-  console.log(`[jobPoller] Starting — polling ${indexerUrl}/jobs/open every ${JOB_POLL_INTERVAL / 1000}s (min: ${JOB_POLLER_MIN_XPR} XPR, max: ${JOB_POLLER_MAX_EVALS_PER_DAY}/day)`);
+  console.log(`[jobPoller] Starting — polling ${indexerUrl}/jobs?state=1 every ${JOB_POLL_INTERVAL / 1000}s (min: ${JOB_POLLER_MIN_XPR} XPR, max: ${JOB_POLLER_MAX_EVALS_PER_DAY}/day)`);
 
   // Initial poll after a short delay (let gateway stabilize)
   setTimeout(() => {
