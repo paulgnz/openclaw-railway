@@ -1885,15 +1885,6 @@ const server = app.listen(PORT, "0.0.0.0", async () => {
         // Enable the OpenAI-compatible HTTP API so the deploy dashboard can chat through the gateway
         await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "--json", "gateway.http.endpoints.chatCompletions.enabled", "true"]));
 
-        // Optional: set agent model from env var
-        if (process.env.AGENT_MODEL?.trim()) {
-          const model = process.env.AGENT_MODEL.trim();
-          // Map short model IDs to anthropic/ prefixed IDs for the gateway
-          const gatewayModel = model.startsWith("anthropic/") ? model : `anthropic/${model}`;
-          await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "agent.model", gatewayModel]));
-          console.log(`[wrapper] Agent model set to: ${gatewayModel}`);
-        }
-
         // Optional channels from env vars — use full config objects (matching /setup wizard)
         if (process.env.TELEGRAM_BOT_TOKEN?.trim()) {
           const tgCfg = {
@@ -1936,15 +1927,6 @@ const server = app.listen(PORT, "0.0.0.0", async () => {
     // without requiring a full re-onboard.
     try {
       let configChanged = false;
-
-      // Model override from env
-      if (process.env.AGENT_MODEL?.trim()) {
-        const model = process.env.AGENT_MODEL.trim();
-        const gatewayModel = model.startsWith("anthropic/") ? model : `anthropic/${model}`;
-        await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "agent.model", gatewayModel]));
-        console.log(`[wrapper] Agent model set to: ${gatewayModel}`);
-        configChanged = true;
-      }
 
       // Telegram channel from env (re-apply on every restart in case token was updated)
       if (process.env.TELEGRAM_BOT_TOKEN?.trim()) {
