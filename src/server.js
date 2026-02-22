@@ -1885,17 +1885,40 @@ const server = app.listen(PORT, "0.0.0.0", async () => {
         // Enable the OpenAI-compatible HTTP API so the deploy dashboard can chat through the gateway
         await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "--json", "gateway.http.endpoints.chatCompletions.enabled", "true"]));
 
-        // Optional channels from env vars
-        if (process.env.TELEGRAM_BOT_TOKEN?.trim()) {
-          await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "channels.telegram.token", process.env.TELEGRAM_BOT_TOKEN.trim()]));
-          console.log("[wrapper] Telegram channel configured");
-        }
-        if (process.env.DISCORD_BOT_TOKEN?.trim()) {
-          await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "channels.discord.token", process.env.DISCORD_BOT_TOKEN.trim()]));
-          console.log("[wrapper] Discord channel configured");
+        // Optional: set agent model from env var
+        if (process.env.AGENT_MODEL?.trim()) {
+          const model = process.env.AGENT_MODEL.trim();
+          // Map short model IDs to anthropic/ prefixed IDs for the gateway
+          const gatewayModel = model.startsWith("anthropic/") ? model : `anthropic/${model}`;
+          await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "agent.model", gatewayModel]));
+          console.log(`[wrapper] Agent model set to: ${gatewayModel}`);
         }
 
-        // Run doctor to fix any issues
+        // Optional channels from env vars — use full config objects (matching /setup wizard)
+        if (process.env.TELEGRAM_BOT_TOKEN?.trim()) {
+          const tgCfg = {
+            enabled: true,
+            dmPolicy: "pairing",
+            botToken: process.env.TELEGRAM_BOT_TOKEN.trim(),
+            groupPolicy: "allowlist",
+            streamMode: "partial",
+          };
+          await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "--json", "channels.telegram", JSON.stringify(tgCfg)]));
+          await runCmd(OPENCLAW_NODE, clawArgs(["plugins", "enable", "telegram"]));
+          console.log("[wrapper] Telegram channel configured and enabled");
+        }
+        if (process.env.DISCORD_BOT_TOKEN?.trim()) {
+          const dcCfg = {
+            enabled: true,
+            token: process.env.DISCORD_BOT_TOKEN.trim(),
+            groupPolicy: "allowlist",
+            dm: { policy: "pairing" },
+          };
+          await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "--json", "channels.discord", JSON.stringify(dcCfg)]));
+          console.log("[wrapper] Discord channel configured and enabled");
+        }
+
+        // Run doctor --fix to apply any "configured but not enabled" changes
         await runCmd(OPENCLAW_NODE, clawArgs(["doctor", "--fix"]));
       } else {
         console.error(`[wrapper] auto-onboarding failed (code=${result.code}):\n${result.output?.slice(0, 500)}`);
@@ -1908,6 +1931,56 @@ const server = app.listen(PORT, "0.0.0.0", async () => {
   // Auto-start the gateway if already configured so polling channels (Telegram/Discord/etc.)
   // work even if nobody visits the web UI.
   if (isConfigured()) {
+    // Apply env var overrides to existing config on every restart.
+    // This handles config changes via the deploy dashboard (model, channels)
+    // without requiring a full re-onboard.
+    try {
+      let configChanged = false;
+
+      // Model override from env
+      if (process.env.AGENT_MODEL?.trim()) {
+        const model = process.env.AGENT_MODEL.trim();
+        const gatewayModel = model.startsWith("anthropic/") ? model : `anthropic/${model}`;
+        await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "agent.model", gatewayModel]));
+        console.log(`[wrapper] Agent model set to: ${gatewayModel}`);
+        configChanged = true;
+      }
+
+      // Telegram channel from env (re-apply on every restart in case token was updated)
+      if (process.env.TELEGRAM_BOT_TOKEN?.trim()) {
+        const tgCfg = {
+          enabled: true,
+          dmPolicy: "pairing",
+          botToken: process.env.TELEGRAM_BOT_TOKEN.trim(),
+          groupPolicy: "allowlist",
+          streamMode: "partial",
+        };
+        await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "--json", "channels.telegram", JSON.stringify(tgCfg)]));
+        await runCmd(OPENCLAW_NODE, clawArgs(["plugins", "enable", "telegram"]));
+        console.log("[wrapper] Telegram channel configured and enabled");
+        configChanged = true;
+      }
+
+      // Discord channel from env
+      if (process.env.DISCORD_BOT_TOKEN?.trim()) {
+        const dcCfg = {
+          enabled: true,
+          token: process.env.DISCORD_BOT_TOKEN.trim(),
+          groupPolicy: "allowlist",
+          dm: { policy: "pairing" },
+        };
+        await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "--json", "channels.discord", JSON.stringify(dcCfg)]));
+        console.log("[wrapper] Discord channel configured and enabled");
+        configChanged = true;
+      }
+
+      if (configChanged) {
+        await runCmd(OPENCLAW_NODE, clawArgs(["doctor", "--fix"]));
+      }
+    } catch (err) {
+      console.error(`[wrapper] env var config override failed (non-fatal): ${String(err)}`);
+    }
+
     console.log("[wrapper] config detected; starting gateway...");
     try {
       await ensureGatewayRunning();
