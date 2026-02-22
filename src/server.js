@@ -132,8 +132,12 @@ Use the xpr_agents plugin tools for all blockchain operations. Key tools:
  * and suppresses OpenClaw's default bootstrap flow by setting a personality prompt.
  */
 async function installXprPlugin(agentAccount, agentMode) {
-  // Install the XPR agents plugin (provides 55+ blockchain tools)
-  console.log("[wrapper] Installing @xpr-agents/openclaw plugin...");
+  // Install/update the XPR agents plugin (provides 70+ blockchain + social tools)
+  console.log("[wrapper] Installing @xpr-agents/openclaw plugin (latest)...");
+
+  // Uninstall first to ensure we get the latest version (openclaw caches installed plugins)
+  await runCmd(OPENCLAW_NODE, clawArgs(["plugins", "uninstall", "@xpr-agents/openclaw"]), { timeoutMs: 30_000 });
+
   const install = await runCmd(OPENCLAW_NODE, clawArgs(["plugins", "install", "@xpr-agents/openclaw"]), { timeoutMs: 180_000 });
   if (install.code === 0) {
     console.log("[wrapper] @xpr-agents/openclaw plugin installed");
@@ -860,7 +864,14 @@ async function doSocialPost() {
       const result = await resp.json();
       const reply = result.choices?.[0]?.message?.content || "";
       console.log(`[socialScheduler] Agent response (${reply.length} chars): ${reply.substring(0, 300)}`);
-      saveLastSocialPostDate(today);
+      // Only save the date if the agent actually succeeded (didn't say it lacks tools)
+      const failed = /don't have|no.*tool|not available|cannot|can't/i.test(reply);
+      if (!failed) {
+        saveLastSocialPostDate(today);
+        console.log(`[socialScheduler] Daily post completed for ${today}`);
+      } else {
+        console.warn(`[socialScheduler] Agent could not post (tools missing?) — will retry next check`);
+      }
     } else {
       console.warn(`[socialScheduler] Gateway returned ${resp.status}`);
     }
