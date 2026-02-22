@@ -788,6 +788,100 @@ function startJobPoller() {
   }, 10_000);
 }
 
+// --- Social Scheduler ---
+// For social-mode agents: triggers a daily Shellbook post.
+// Checks every hour; posts once per calendar day.
+
+const SOCIAL_CHECK_INTERVAL = 60 * 60 * 1000; // 1 hour
+const SOCIAL_LAST_POST_FILE = path.join(STATE_DIR, "social-last-post.txt");
+let socialTimer = null;
+
+function getLastSocialPostDate() {
+  try {
+    return fs.readFileSync(SOCIAL_LAST_POST_FILE, "utf8").trim();
+  } catch {
+    return "";
+  }
+}
+
+function saveLastSocialPostDate(dateStr) {
+  try {
+    fs.mkdirSync(path.dirname(SOCIAL_LAST_POST_FILE), { recursive: true });
+    fs.writeFileSync(SOCIAL_LAST_POST_FILE, dateStr, "utf8");
+  } catch (err) {
+    console.warn(`[socialScheduler] Failed to save last post date: ${String(err)}`);
+  }
+}
+
+async function doSocialPost() {
+  const agentMode = (process.env.AGENT_MODE || "worker").toLowerCase();
+  if (agentMode !== "social") return;
+
+  const agentAccount = process.env.XPR_ACCOUNT?.trim();
+  if (!agentAccount) return;
+
+  const today = new Date().toISOString().slice(0, 10);
+  const lastPost = getLastSocialPostDate();
+
+  if (lastPost === today) return; // Already posted today
+
+  console.log(`[socialScheduler] Daily post due (last: ${lastPost || "never"}, today: ${today})`);
+
+  const message = [
+    `Time for your daily Shellbook activity! Today is ${today}.`,
+    "",
+    "1. First, check what's happening on Shellbook — use shell_list_posts to see recent posts from other agents and users.",
+    "2. Engage with 1-2 interesting posts (shell_vote or shell_create_comment).",
+    "3. Create one original post using shell_create_post. Share something interesting — it could be about XPR Network, DeFi, NFTs, AI agents, crypto, or anything your community would enjoy. Be authentic and conversational.",
+    "",
+    `Your account is: ${agentAccount}`,
+  ].join("\n");
+
+  try {
+    await ensureGatewayRunning();
+
+    const gatewayUrl = `${GATEWAY_TARGET}/v1/chat/completions`;
+    const resp = await fetch(gatewayUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${OPENCLAW_GATEWAY_TOKEN}`,
+        "x-openclaw-agent-id": "main",
+        "x-openclaw-session-key": "agent:main:social",
+      },
+      body: JSON.stringify({
+        model: "openclaw",
+        messages: [{ role: "user", content: message }],
+      }),
+      signal: AbortSignal.timeout(120_000),
+    });
+
+    if (resp.ok) {
+      const result = await resp.json();
+      const reply = result.choices?.[0]?.message?.content || "";
+      console.log(`[socialScheduler] Agent response (${reply.length} chars): ${reply.substring(0, 300)}`);
+      saveLastSocialPostDate(today);
+    } else {
+      console.warn(`[socialScheduler] Gateway returned ${resp.status}`);
+    }
+  } catch (err) {
+    console.warn(`[socialScheduler] Failed: ${String(err)}`);
+  }
+}
+
+function startSocialScheduler() {
+  const agentMode = (process.env.AGENT_MODE || "worker").toLowerCase();
+  if (agentMode !== "social") return;
+
+  console.log(`[socialScheduler] Starting — checking every ${SOCIAL_CHECK_INTERVAL / 1000 / 60}min for daily post`);
+
+  // Initial check after 30s (let gateway stabilize)
+  setTimeout(() => {
+    doSocialPost();
+    socialTimer = setInterval(doSocialPost, SOCIAL_CHECK_INTERVAL);
+  }, 30_000);
+}
+
 // --- Gateway session history via WebSocket RPC ---
 // Opens a per-request WebSocket to the gateway, authenticates, fetches chat history, then closes.
 async function getGatewayHistory(sessionKey = "agent:main:main", limit = 50) {
@@ -2129,6 +2223,9 @@ const server = app.listen(PORT, "0.0.0.0", async () => {
 
       // Start job board poller after gateway is ready
       startJobPoller();
+
+      // Start social scheduler (daily Shellbook posts for social-mode agents)
+      startSocialScheduler();
     } catch (err) {
       console.error(`[wrapper] gateway failed to start at boot: ${String(err)}`);
     }
