@@ -2275,8 +2275,9 @@ const server = app.listen(PORT, "0.0.0.0", async () => {
       // Agent model override from env (e.g. "anthropic/claude-sonnet-4-6")
       if (process.env.AGENT_MODEL?.trim()) {
         const model = process.env.AGENT_MODEL.trim();
-        await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "agents.agent.model", model]));
-        console.log(`[wrapper] Agent model set to ${model}`);
+        const modelResult = await runCmd(OPENCLAW_NODE, clawArgs(["models", "set", model]));
+        console.log(`[wrapper] Agent model set to ${model} (exit=${modelResult.code})`);
+        if (modelResult.output?.trim()) console.log(`[wrapper] models set output: ${modelResult.output.trim()}`);
         configChanged = true;
       }
 
