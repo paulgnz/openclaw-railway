@@ -314,8 +314,7 @@ async function startGateway() {
 
   // Ensure gateway config is correct on every start (covers existing deployments that
   // onboarded before these settings were added).
-  // NOTE: Do NOT set gateway.auth.mode here — "none" is not a valid config file value.
-  // The --auth none CLI flag on `gateway run` handles this as a runtime override.
+  // Gateway uses --auth token with the wrapper's gateway token.
   try {
     await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.bind", "loopback"]));
     await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.port", String(INTERNAL_GATEWAY_PORT)]));
@@ -332,6 +331,14 @@ async function startGateway() {
     console.error(`[gateway] config pre-flight failed (non-fatal): ${String(err)}`);
   }
 
+  // Clean up stale lock files from previous runs
+  for (const lockPath of [
+    path.join(STATE_DIR, "gateway.lock"),
+    "/tmp/openclaw-gateway.lock",
+  ]) {
+    try { fs.rmSync(lockPath, { force: true }); } catch {}
+  }
+
   // Gateway listens on loopback only — the wrapper handles all external authentication.
   const args = [
     "gateway",
@@ -341,7 +348,10 @@ async function startGateway() {
     "--port",
     String(INTERNAL_GATEWAY_PORT),
     "--auth",
-    "none",
+    "token",
+    "--token",
+    OPENCLAW_GATEWAY_TOKEN,
+    "--allow-unconfigured",
   ];
 
   gatewayProc = childProcess.spawn(OPENCLAW_NODE, clawArgs(args), {
@@ -1463,7 +1473,7 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
   if (ok) {
     // Gateway runs on loopback — the wrapper handles all external authentication.
     // NOTE: Do NOT set gateway.auth.mode — "none" is invalid in config schema.
-    // The --auth none CLI flag handles this at runtime.
+    // Gateway uses --auth token at runtime.
     await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.bind", "loopback"]));
     await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.port", String(INTERNAL_GATEWAY_PORT)]));
 
@@ -2093,8 +2103,9 @@ app.use(async (req, res) => {
     }
   }
 
-  // Gateway runs with --auth none on loopback — proxy directly.
+  // Inject gateway auth token into proxied requests (gateway requires --auth token).
   // External auth is handled by the requireWrapperAuth middleware.
+  req.headers["authorization"] = `Bearer ${OPENCLAW_GATEWAY_TOKEN}`;
   return proxy.web(req, res, { target: GATEWAY_TARGET });
 });
 
@@ -2340,8 +2351,8 @@ server.on("upgrade", async (req, socket, head) => {
     return;
   }
 
-  // Gateway runs with --auth none on loopback — no token injection needed.
-  // The wrapper already authenticated the external user above.
+  // Inject gateway auth token into WebSocket upgrade (gateway requires --auth token).
+  req.headers["authorization"] = `Bearer ${OPENCLAW_GATEWAY_TOKEN}`;
   proxy.ws(req, socket, head, { target: GATEWAY_TARGET });
 });
 
